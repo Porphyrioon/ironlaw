@@ -1,261 +1,261 @@
 # IronLaw Plugin
 
-> 把上万条工程会话里的踩坑记录，变成编程助手外部的交付纪律。  
-> 面向多宿主编程助手的统一外挂；只盯三件事：少返工、不偏离、不接受奖励作弊式的假完成。
+> Turn tens of thousands of hard-won lessons from real engineering sessions into delivery discipline, enforced outside the coding assistant.  
+> One host-agnostic layer for every coding assistant; it only cares about three things: less rework, no drift, no reward-hacked fake "done".
 
-## 这是什么
+## What it is
 
-IronLaw 不是新的编程助手，也不是把 OpenCode 重做一遍。它是一个挂在编程助手外面的效率工程组件：
+IronLaw is not a new coding assistant, and it is not a re-implementation of OpenCode. It is an efficiency-engineering component that sits outside the coding assistant:
 
 ```text
-DeepSeek Harness / OpenCode / Claude / Grok / Zcode / Codex / Qoder / 其它薄壳编程助手
+DeepSeek Harness / OpenCode / Claude / Grok / Zcode / Codex / Qoder / other thin-shell assistants
           │
-          └── IronLaw 外挂：任务约束、事实证据、完成闸门、有限纠偏
+          └── IronLaw layer: task constraints, factual evidence, completion gate, bounded repair
 ```
 
-它的出发点来自上万条工程会话中反复出现的失败模式：模型并不一定没有能力，很多时候是缺少一套在长任务中持续约束它的外部机制。IronLaw 不试图把模型变成另一个模型，而是把任务过程变成可验证的工程流程。
+It starts from failure patterns that recur across tens of thousands of engineering sessions: the model is usually capable, but often lacks an external mechanism that keeps constraining it through a long task. IronLaw does not try to turn one model into another; it turns the task process into a verifiable engineering process.
 
-用户仍然使用原来的 GUI、Provider、模型、工具和工作区。IronLaw 不要求用户切换工作台，也不要求用户理解 MCP；首发形态是统一 CLI 安装器、统一 sidecar 内核和按宿主加载的薄插件/Hook 适配器。
+Users keep their original GUI, provider, model, tools, and workspace. IronLaw does not require switching workbenches or understanding MCP; the launch shape is a unified CLI installer, a unified sidecar kernel, and thin per-host plugin/hook adapters.
 
 ```bash
 npx @ironlaw/cli install --host opencode
 ```
 
-安装后，用户继续正常使用对应宿主。IronLaw 在后台记录事实、检查任务状态，并在必要时提醒、阻断或要求最小修复。这里描述的是可观测机制，不是对任何模型、宿主或任务结果的保证。
+After install, the user keeps using the host normally. IronLaw records facts, checks task state, and reminds, blocks, or requests a minimal repair when needed. What is described here is an observable mechanism, not a guarantee about any model, host, or task outcome.
 
-## 为什么开源的是 Plugin，而不是 Skill 或 MCP
+## Why it is a Plugin, not a Skill or an MCP server
 
-理解 IronLaw 的接入形式，要先区分 Router、Skill、MCP 和 Plugin 的职责：
+To understand IronLaw's integration shape, first separate the responsibilities of Router, Skill, MCP, and Plugin:
 
 ```text
-用户输入
+User input
    │
    ▼
-Router：选择 Agent / Provider / Model / Skill
+Router: choose Agent / Provider / Model / Skill
    │
    ▼
-Agent + Skill：理解任务、规划步骤、提出工具调用
+Agent + Skill: understand the task, plan steps, propose tool calls
    │
    ▼
-OpenCode Runtime：真正执行工具、写文件、跑命令、结束会话
+OpenCode Runtime: actually executes tools, writes files, runs commands, ends the session
    │
-   └──── IronLaw Plugin：观察、约束、审计、纠偏
+   └──── IronLaw Plugin: observe, constrain, audit, repair
                          │
                          ▼
                     ironlawd sidecar
 ```
 
-### Skill：方法论载体，不是执行边界
+### Skill: a carrier of methodology, not an enforcement boundary
 
-Skill 适合固化“应该怎么做”的知识：检查清单、代码风格、某个框架的工作方法、某类任务的提示模板。Router 可以根据任务把 Skill 选择并加载给 Agent。
+A Skill is good at freezing "how it should be done": checklists, code style, a framework's workflow, prompt templates for a class of tasks. A Router can select and load a Skill for the agent by task.
 
-但 Skill 仍然属于模型上下文：
+But a Skill still lives inside the model context:
 
-- 模型可能没有选中它，或只部分遵循；
-- 上下文压缩后可能丢失或被后续内容覆盖；
-- 它不能确认命令是否真实执行；
-- 它不能读取独立的工作区指纹和产物哈希；
-- 它不能在工具执行前硬阻断危险动作；
-- 它不能给“完成”授予可信证据。
+- the model may not select it, or may follow it only partially;
+- it may be dropped or overwritten after compaction;
+- it cannot confirm whether a command actually ran;
+- it cannot read an independent workspace fingerprint or artifact hash;
+- it cannot hard-block a dangerous action before the tool runs;
+- it cannot grant trustworthy evidence to "done".
 
-因此 IronLaw 的规则可以被 Skill 借鉴，但不能把 IronLaw 本身交付成 Skill。Skill 是建议层，IronLaw 要解决的是过程控制和交付判定。
+So IronLaw's rules can be borrowed by a Skill, but IronLaw itself must not ship as a Skill. A Skill is the advice layer; IronLaw solves process control and delivery adjudication.
 
-### MCP：模型可调用的能力，不是外部监督层
+### MCP: a model-callable capability, not an external supervisor
 
-MCP 适合把搜索、数据库、外部 API 或人工查询能力提供给模型。模型需要看到工具 schema，并主动决定是否调用。
+MCP is good at giving the model search, databases, external APIs, or human-query capabilities. The model sees the tool schema and decides whether to call it.
 
-这不适合做 IronLaw 的主路径：
+That is not the right main path for IronLaw:
 
-- 工具描述和 schema 会增加上下文 Token；
-- 模型可以不调用治理工具；
-- 模型调用后的结果仍可能被包装成自报材料；
-- MCP 不天然拥有宿主的完整 session、tool、permission 和 compaction 生命周期；
-- 它不能可靠地阻止一个已经由宿主准备执行的工具调用。
+- tool descriptions and schemas add context tokens;
+- the model may simply not call the governance tools;
+- what the model calls and reports can still be dressed up as self-reported material;
+- MCP does not natively own the host's full session/tool/permission/compaction lifecycle;
+- it cannot reliably stop a tool call the host is already about to execute.
 
-所以 MCP 可以作为将来的人工查询接口，例如查看报告、批准待审动作，但不能承担 IronLaw 的完成闸门。
+So MCP can serve as a future human-query interface — viewing reports, approving pending actions — but it cannot carry IronLaw's completion gate.
 
-### Plugin：唯一适合做宿主级治理的薄层
+### Plugin: the only thin layer suited for host-level governance
 
-Plugin 运行在 OpenCode 的宿主生命周期内，能接触到 Router 之后实际发生的消息、工具、权限、文件和 session 事件。它可以：
+A Plugin runs inside OpenCode's host lifecycle and can see the messages, tools, permissions, files, and session events that actually happen after the Router. It can:
 
-- 在工具执行前检查和阻断；
-- 在工具执行后记录真实返回；
-- 在消息请求或压缩时注入短任务锚点；
-- 在 session idle 后触发完成审计；
-- 把事实交给独立 sidecar，而不是让模型自己给自己评分。
+- check and block before a tool executes;
+- record the real return value after a tool executes;
+- inject a short task anchor at message request or compaction time;
+- trigger a completion audit after session idle;
+- hand facts to an independent sidecar instead of letting the model grade itself.
 
-因此三者的关系是：
+So the relationship is:
 
 ```text
-Router 负责“把任务交给谁、用什么模型和 Skill”
-Skill 负责“模型应该采用什么方法”
-MCP 负责“模型可以主动调用哪些外部能力”
-Plugin 负责“宿主实际发生了什么，哪些动作可以继续，是否真的完成”
+Router  decides who gets the task, with what model and Skill
+Skill   decides what method the model should use
+MCP     decides which external capabilities the model may call
+Plugin  decides what actually happened on the host, which actions may continue, and whether it really finished
 ```
 
-IronLaw 不和 Router 抢路由，不和 Skill 抢方法论，也不和 MCP 抢工具生态。它补的是三者都不负责的交付控制面：减少返工、防止偏离、识别奖励作弊式假完成。这里描述的是插件的机制和观测边界，不是结果保证。
+IronLaw does not fight Router for routing, Skill for methodology, or MCP for the tool ecosystem. It fills the delivery-control surface none of the three own: less rework, no drift, and catching reward-hacked fake completion. This describes the plugin's mechanism and observation boundary, not an outcome guarantee.
 
-## 三个核心目标
+## The three core goals
 
-### 1. 减少返工
+### 1. Less rework
 
-让每一轮执行都对准最终交付，而不是先做一个“看起来能跑”的最小框架，再由用户补规格、补测试、补构建、补部署。IronLaw 用任务契约、需求-证据映射和交付链检查，把返工风险尽量前移暴露。
+Make every execution round aim at the final delivery, instead of first building a "looks like it runs" minimal frame and then having the user backfill spec, tests, build, and deployment. IronLaw uses a Task Contract, requirement-evidence mapping, and delivery-chain checks to surface rework risk as early as possible.
 
-### 2. 防止偏离
+### 2. No drift
 
-让模型在上下文压缩、长时间执行和 handoff 之后仍然回到原始 spec，而不是把相邻问题当成新目标。IronLaw 保存原始要求、约束和允许范围，并在检测到漂移时用短锚点纠偏。
+Make the model return to the original spec after context compaction, long execution, and handoffs, instead of treating an adjacent problem as the new goal. IronLaw keeps the original requirements, constraints, and allowed scope, and corrects with a short anchor when drift is detected.
 
-### 3. 识别奖励作弊式假完成
+### 3. Catch reward-hacked fake "done"
 
-不接受“测试通过”“构建完成”“已经修好”这类自然语言作为交付事实。IronLaw 要求工具事件、退出码、文件变化、工作区指纹、真实构建和最终旅程形成独立证据；证据不足时，任务只能是未验证、待修复或失败，不能标成完成。
+Natural-language claims like "tests passed", "build done", or "already fixed" are not accepted as delivery facts. IronLaw requires independent evidence from tool events, exit codes, file changes, workspace fingerprints, real builds, and the final journey. When evidence is insufficient, the task can only be unverified, pending-repair, or failed — never "done".
 
-## 为什么这三件事会反复发生
+## Why these three keep happening
 
-### 验证通过，不等于可交付
+### A green test does not mean shippable
 
-一条测试命令退出码为 0，只能说明某个命令成功结束，不能证明：
+A test command exiting 0 only means one command ended successfully. It does not prove:
 
-- 测试真的覆盖了原始需求；
-- 没有把真实路径替换成 mock；
-- 不是错误的测试子集或空测试；
-- 测试通过后源文件没有再次变化；
-- 构建产物真的存在并能启动；
-- 用户要求的安装、部署、重开或交付旅程已经完成。
+- the test actually covers the original requirement;
+- the real path was not replaced with a mock;
+- it is not the wrong test subset or an empty test;
+- the source did not change again after the test passed;
+- the build artifact really exists and starts;
+- the install, deploy, relaunch, or delivery journey the user asked for is complete.
 
-这正是奖励作弊最容易发生的地方：模型优化了“让当前测验通过”，却没有完成用户真正要交付的东西。IronLaw 把“测试通过”与“交付完成”分开判定。
+This is exactly where reward hacking happens: the model optimizes "make the current check pass" without delivering what the user actually wants. IronLaw judges "test passed" and "delivery complete" separately.
 
-### 最小框架、最短路径，常常换来多轮返工
+### Minimal frame, shortest path, usually means more rounds of rework
 
-模型容易选择眼前最短的实现路径：先写一个最小框架、先让测试变绿、先生成一个中间产物。这个策略短期看起来高效，但可能遗漏约束、改变边界或绕开最终用户旅程，最后由用户补充说明、重新测试、重新打包。
+The model tends to pick the shortest-looking path: write a minimal frame first, get the tests green first, produce an intermediate artifact first. That looks efficient in the short term, but may drop constraints, move boundaries, or bypass the final user journey — and the user ends up re-specifying, re-testing, and re-packaging.
 
-IronLaw 不禁止合理的最小实现，而是要求实现路径持续映射到原始 spec 和最终验收项：没有减少交付缺口的动作，不能被当作有效进展。这样做的目的不是让模型多写代码，而是减少“做完一轮又推倒重来”的返工。
+IronLaw does not forbid a reasonable minimal implementation; it requires the implementation path to keep mapping to the original spec and final acceptance items. An action that does not shrink the delivery gap is not valid progress. The point is not to make the model write more code, but to reduce the "finished one round, tear it down, redo it" rework.
 
-### 中长程任务容易在压缩后漂移
+### Mid-to-long tasks drift after compaction
 
-上下文压缩、长时间工具调用和多轮 handoff 之后，模型可能忘记原始目标，开始解决一个相邻但没有被要求的问题。模型的 todo、handoff 或“我记得用户想要……”不能替代原始任务。
+After context compaction, long tool runs, and several handoffs, the model may forget the original goal and start solving an adjacent problem nobody asked for. The model's todo, handoff, or "I remember the user wanted…" cannot replace the original task.
 
-IronLaw 保存原始任务契约，并在真正需要时注入一个很短的任务锚点，而不是每轮重复整份历史。任务锚点的作用是守住边界，不是把新的长提示词塞回模型。
+IronLaw keeps the original task contract and injects a very short task anchor only when actually needed — not repeating the whole history every round. The anchor's job is to hold the boundary, not to stuff a new long prompt back into the model.
 
-### 模型可以声称做过，但没有做过
+### The model can claim it did something it never did
 
-“测试已通过”“构建已完成”“文件已更新”都只是模型文本。若事件流里没有对应工具调用、退出码、文件变化或产物哈希，这些内容只能算待核验声明，不能成为完成证据。这是 IronLaw 对奖励作弊机制的直接防线：模型可以汇报，但不能自己颁发交付证书。
+"Tests passed", "build completed", "files updated" are just model text. If the event stream has no matching tool call, exit code, file change, or artifact hash, these are only claims awaiting verification — not completion evidence. This is IronLaw's direct defense against reward hacking: the model may report, but it cannot issue its own delivery certificate.
 
-### 任务结束后还在无休止地继续
+### The task keeps going forever after it is done
 
-没有外部完成边界时，模型可能在汇报之后继续推理、反复修改或顺手扩展范围，消耗 Token 却没有增加交付价值。
+Without an external completion boundary, the model may keep reasoning, re-editing, or casually expanding scope after reporting, spending tokens without adding delivery value.
 
-IronLaw 把续写变成有条件、可计数、必须有进展的修复动作；没有新证据或没有减少硬缺口，就停止自动续写。
+IronLaw turns continuation into a conditional, counted, must-make-progress repair action; with no new evidence or no hard gap closed, auto-continuation stops.
 
-## IronLaw 的功能，用通俗的话说
+## What IronLaw does, in plain words
 
-| 用户看到的功能 | 背后的机制 | 主要遏制/预防 |
+| What the user sees | Mechanism behind it | What it mainly prevents |
 |---|---|---|
-| 记住任务真正要求了什么 | Task Contract、原始输入哈希、任务锚点 | spec 漂移、压缩后忘记目标、handoff 改写需求 |
-| 知道模型到底做没做 | Event Ledger、工具事件、退出码、文件和 Git 事实 | 自报完成、捏造测试、虚构命令 |
-| 不把绿灯误认为交付 | CompletionGate、需求-证据映射、交付链检查 | 测试通过但不可交付、构建缺产物、只做中间文件 |
-| 危险动作先停下来 | 确定性 Policy Engine、工作区边界检查 | 越界删除、危险 Git 操作、未授权发布 |
-| 发现正在跑偏或空转 | Drift Score、进展检测、缺口变化比较 | 长程偏离、重复修改、无效循环 |
-| 需要继续时只补最小缺口 | 有限 Repair Loop、修复指纹、预算上限 | 尿不尽、无限续写、无效重试 |
-| 插件坏了也不拖垮宿主 | sidecar watchdog、能力握手、降级策略 | 插件故障导致 OpenCode 无法使用 |
+| Remembering what the task really asked | Task Contract, original-input hash, task anchor | spec drift, forgetting the goal after compaction, handoff rewriting the requirement |
+| Knowing whether the model actually did it | Event Ledger, tool events, exit codes, file and Git facts | self-reported completion, fabricated tests, imaginary commands |
+| Not mistaking a green light for delivery | CompletionGate, requirement-evidence mapping, delivery-chain check | test passed but not shippable, build missing artifacts, only intermediate files made |
+| Stopping dangerous actions first | deterministic Policy Engine, workspace-boundary checks | out-of-scope deletion, dangerous Git operations, unauthorized publish |
+| Detecting drift or spinning | Drift Score, progress detection, gap-delta comparison | long-range deviation, repeated edits, useless loops |
+| Repairing only the smallest gap when continuing | bounded Repair Loop, repair fingerprint, budget cap | endless "one more thing", infinite continuation, useless retries |
+| A broken plugin doesn't take down the host | sidecar watchdog, capability handshake, degradation strategy | plugin failure making OpenCode unusable |
 
-## 技术原理
+## Technical principles
 
-### 1. 外部状态机，而不是隐藏的第二个 Leader
+### 1. An external state machine, not a hidden second Leader
 
-IronLaw 不让另一个大模型每轮点评 Worker。它把单 Agent 任务放进一个模型外部的有限状态机：
+IronLaw does not have another large model review the worker every round. It puts a single-agent task into a finite state machine outside the model:
 
 ```text
 OBSERVING
-    ↓ 识别到代码任务
+    ↓ code task recognized
 ACTIVE
-    ↓ 模型停止 / 声称完成
+    ↓ model stops / claims done
 VERIFYING
-    ├─ 全部硬验收有有效证据 → VERIFIED
-    ├─ 缺口可修复             → REPAIR_REQUIRED
-    ├─ 危险或越界动作         → BLOCKED
-    └─ 预算耗尽 / 无进展       → FAILED_UNVERIFIED
+    ├─ all hard acceptance has valid evidence → VERIFIED
+    ├─ gap is repairable                    → REPAIR_REQUIRED
+    ├─ dangerous or out-of-scope action     → BLOCKED
+    └─ budget exhausted / no progress       → FAILED_UNVERIFIED
 ```
 
-模型不能直接把任务写成 `VERIFIED`，todo 不能直接把任务写成 `VERIFIED`，单个命令退出码为 0 也不能直接把任务写成 `VERIFIED`。只有 CompletionGate 能授予交付状态。
+The model cannot write the task directly to `VERIFIED`; the todo cannot write it directly to `VERIFIED`; a single command exiting 0 cannot write it directly to `VERIFIED`. Only the CompletionGate may grant delivery status.
 
-### 2. 证据账本与证据等级
+### 2. Evidence ledger and evidence grades
 
-每条证据记录来源、时间、工作区指纹、命令摘要和相关验收项。证据产生后，如果相关源文件再次变化，旧证据自动失效。
+Every evidence record stores its source, time, workspace fingerprint, command summary, and related acceptance items. Once evidence is produced, if the related source file changes again, the old evidence is automatically invalidated.
 
 ```text
-E0  模型自然语言声称完成
-E1  todo / handoff / 自报文件列表
-E2  OpenCode 工具调用及返回值
-E3  sidecar 独立执行的文件、Git、命令和哈希检查
-E4  sidecar 执行的真实测试、构建、启动、重开和产物检查
+E0  model natural-language claim of completion
+E1  todo / handoff / self-reported file list
+E2  OpenCode tool call and its return value
+E3  sidecar's independent file, Git, command, and hash checks
+E4  sidecar's real test, build, launch, relaunch, and artifact checks
 ```
 
-E0 和 E1 不能升级为 E3/E4。一个典型的“奖励作弊”路径是：修改测试让它通过、只运行错误子集、声称运行了命令、或只生成了配置文件。IronLaw 会把这些行为拆成事实检查，而不是接受模型的总结。
+E0 and E1 cannot be upgraded into E3/E4. A typical reward-hack path is: modify the test so it passes, run only the wrong subset, claim a command ran, or only generate a config file. IronLaw breaks these into fact checks instead of accepting the model's summary.
 
-### 3. 需求-证据图，而不是单一测试开关
+### 3. A requirement-evidence graph, not a single test switch
 
-原始任务被拆成硬验收项、禁止事项、允许范围和期望证据。完成判定按交付链逐项检查：
+The original task is decomposed into hard acceptance items, prohibitions, allowed scope, and expected evidence. Completion is checked item by item along the delivery chain:
 
 ```text
-需求映射
-  → 实现变更
-  → 有效测试
-  → 真实构建/启动
-  → 用户旅程
-  → 持久化/重开
-  → 最终产物
+requirement mapping
+  → implementation change
+  → valid test
+  → real build/launch
+  → user journey
+  → persistence/relaunch
+  → final artifact
 ```
 
-缺少其中任一硬环节，状态就是未完成或被阻塞，而不是“通过但有保留”。
+If any hard link is missing, the state is incomplete or blocked — not "passed with reservations".
 
-### 4. 低成本 Re-anchor 与漂移检测
+### 4. Low-cost re-anchor and drift detection
 
-IronLaw 不在每一轮重复注入整份 spec，而是在任务建立、上下文压缩、证据过期或明显漂移时注入约 200–400 tokens 的任务胶囊：
+IronLaw does not re-inject the whole spec every round. It injects a ~200–400 token task capsule at task establishment, context compaction, evidence expiration, or obvious drift:
 
 ```text
 [IronLaw task anchor]
-Objective: 修复刷新后登录态丢失。
-Open requirements: AC-2 过期 token 错误；AC-3 真实刷新旅程。
-Constraints: 不换认证框架；不得声称未执行的测试已通过。
-Current evidence: unit=pass；build=stale；journey=missing。
-Completion rule: 全部硬验收有有效证据后才能报告完成。
+Objective: fix login-state loss after refresh.
+Open requirements: AC-2 expired-token error; AC-3 real refresh journey.
+Constraints: don't swap the auth framework; never claim an unrun test passed.
+Current evidence: unit=pass; build=stale; journey=missing.
+Completion rule: all hard acceptance must have valid evidence before reporting done.
 ```
 
-漂移分数只负责触发提醒或阻断策略，不作为完成证据。检测信号包括：修改范围与未完成验收项无关、连续修改但没有新证据、压缩后目标消失、handoff 与原始 spec 冲突等。
+The drift score only triggers a reminder or a blocking policy; it is not completion evidence. Signals include: edits unrelated to open acceptance items, repeated edits with no new evidence, the goal disappearing after compaction, handoff conflicting with the original spec.
 
-### 5. 有限修复与成本控制
+### 5. Bounded repair and cost control
 
-自动修复不是泛泛地让模型“继续努力”，而是只发送当前最小缺口：
+Auto-repair is not a vague "keep trying"; it only sends the current smallest gap:
 
-- 默认最多 1 轮；
-- 后续 Managed 模式最多 2 轮；
-- 每轮必须减少至少一个硬缺口；
-- 同一个决策指纹不得重复续写；
-- 用户停止、预算超限或没有进展时立即终止；
-- 修复消息带防递归标记，不重新创建任务。
+- at most 1 round by default;
+- at most 2 rounds in later Managed mode;
+- each round must close at least one hard gap;
+- the same decision fingerprint must not continue twice;
+- stop immediately on user stop, budget exhaustion, or no progress;
+- repair messages carry an anti-recursion marker and never re-create the task.
 
-因此 IronLaw 的目标不是让每个任务都多跑几轮，而是用很小的固定开销，减少整项任务失败后的人肉返工。
+So IronLaw's goal is not to make every task run more rounds, but to use a small fixed overhead to reduce the manual rework after a whole task fails.
 
-### 5.1 Sidecar/子进程生命周期护栏（不是多 Agent 席位）
+### 5.1 Sidecar/subprocess lifecycle guardrails (not multi-agent seats)
 
-这里的“子进程”只指插件 sidecar 或宿主明确启动的 OS 进程，不指另一个 Agent，也不代表 Leader/Worker 席位。插件本身不创建多 Agent、不分配席位、不派发角色。需要防的是同一会话/同一外部启动请求重复拉起进程、父进程退出后子进程继续运行，最终积累大量 Bun/OpenCode 进程。
+"Subprocess" here only means the plugin sidecar or an OS process the host explicitly starts — not another agent, and not a Leader/Worker seat. The plugin does not create multi-agent setups, assign seats, or dispatch roles. What must be prevented is the same session / same external start request pulling up processes repeatedly, and children outliving a dead parent, accumulating large numbers of Bun/OpenCode processes.
 
-因此统一内核必须把 sidecar/子进程生命周期当作 P0 问题处理：
+So the unified kernel must treat sidecar/subprocess lifecycle as a P0 problem:
 
-- 每次启动绑定 `lease_id`、父进程、session、启动时间和任务预算；
-- 同一 `handoff_id` 幂等，禁止重复启动；
-- 每个受 IronLaw 管理的子进程有 wall-clock TTL、空闲 TTL 和最大重试数；
-- 父进程退出、心跳丢失或任务进入失败态时回收子进程树；
-- 启动前检查同一项目/会话是否已有活动 lease；
-- `status` 显示活动 lease、孤儿 lease、累计 CPU 和内存；
-- `doctor --workers` 能列出并安全回收 IronLaw 自己启动的子进程；
-- 不得按全局 `bun` 名称粗暴杀进程，必须按 lease、命令摘要和父子关系精确识别。
+- every start binds a `lease_id`, parent process, session, start time, and task budget;
+- the same `handoff_id` is idempotent and must not start twice;
+- every IronLaw-managed subprocess has a wall-clock TTL, an idle TTL, and a max retry count;
+- reclaim the child tree when the parent exits, heartbeat is lost, or the task enters a failed state;
+- check for an existing active lease for the same project/session before starting;
+- `status` shows active leases, orphan leases, and cumulative CPU and memory;
+- `doctor --workers` lists and safely reclaims subprocesses IronLaw itself started;
+- never kill by the global `bun` name; identify precisely by lease, command summary, and parent-child relation.
 
-本机曾出现 25 个持续运行的 `opencode run --format json --pure` 子进程，累计约 2GB 内存；这类事件优先于任何新的宿主适配器。没有生命周期护栏，插件运行时本身就会制造返工和成本问题。
+This machine once accumulated 25 running `opencode run --format json --pure` subprocesses, roughly 2 GB of memory; that class of incident outranks any new host adapter. Without lifecycle guardrails, the plugin's own runtime would create rework and cost problems.
 
-### 6. Hook + sidecar，而不是默认 MCP
+### 6. Hook + sidecar, not MCP by default
 
-OpenCode 插件负责接收宿主事件、执行快速前置策略和注入短锚点；本地 sidecar 负责状态机、证据账本、工作区检查和完成审计。
+The OpenCode plugin receives host events, runs fast pre-policy checks, and injects short anchors; the local sidecar owns the state machine, evidence ledger, workspace checks, and completion audit.
 
 ```text
 OpenCode GUI / Provider / Agent
@@ -266,48 +266,48 @@ OpenCode GUI / Provider / Agent
        ironlawd sidecar
 ```
 
-首发不把十几个治理工具注册给模型。这样可以避免固定的 MCP schema Token 税，也避免把“是否完成”的判断交给模型主动调用工具。MCP 将来可以作为人工查询或跨宿主兼容接口，但不是首发主路径。
+The launch does not register a dozen governance tools with the model. This avoids a fixed MCP-schema token tax, and avoids handing the "is it done" judgment to the model's voluntary tool calls. MCP may later serve as a human-query or cross-host compatibility interface, but it is not the launch main path.
 
-### 7. 把“铁律”翻译成可执行算法
+### 7. Turning the "iron rules" into executable algorithms
 
-Hackathon 方案里讨论的铁律，不是再写一段更长的 system prompt，而是把几种方法论变成可执行的编排算法：
+The iron rules discussed in the Hackathon design are not another longer system prompt; they become executable orchestration algorithms:
 
-| 方法论 | 在外挂中的技术化表达 | 解决的问题 |
+| Methodology | Technical expression in the layer | Problem it solves |
 |---|---|---|
-| VDDG 熵减 | 意图编译、Task Contract、需求-证据映射 | 输入发散、目标模糊、最短路径误解需求 |
-| 边界守恒 | allowed scope、must/must-not、工具前置策略 | 任务边界被扩大、handoff 改写原始要求 |
-| 循环控制 | 有限状态机、进展评分、修复预算、幂等指纹 | 长程空转、反复修改、无休止续写 |
-| 证据守恒 | Event Sourcing、证据等级、工作区哈希、stale invalidation | 自报结果冒充事实、旧测试冒充新证据 |
-| 受控熵增 | 受约束的方案探索和候选比较 | 只追求眼前最短路径、没有论证就进入执行 |
+| VDDG entropy reduction | intent compilation, Task Contract, requirement-evidence mapping | divergent input, vague goal, shortest-path misreading of the requirement |
+| boundary conservation | allowed scope, must/must-not, tool pre-policy | task boundary widened, handoff rewriting the original requirement |
+| loop control | finite state machine, progress scoring, repair budget, idempotent fingerprint | long-range spinning, repeated edits, endless continuation |
+| evidence conservation | event sourcing, evidence grades, workspace hash, stale invalidation | self-reported results passing as facts, stale tests passing as new evidence |
+| controlled entropy increase | constrained exploration and candidate comparison | chasing only the shortest path, executing without arguing it through |
 
-首发统一内核实现的是前四项的单 Agent 外挂闭环；受控熵增、模型认证和多 Agent 协作属于其它组件，不在本插件承诺范围内。
+The launch unified kernel implements the first four as a single-agent closed loop; controlled entropy increase, model certification, and multi-agent collaboration belong to other components, outside this plugin's committed scope.
 
-### 8. 不是所有模型都用同一种护栏
+### 8. Not every model gets the same guardrail
 
-长期方向是从真实工程会话中提炼模型行为标签，例如：跳步倾向、工具调用准确率、边界意识、讨好型输出和长程稳定性。标签不是用来给模型打分炫技，而是让编排层选择不同的任务粒度、检查点和审查强度。
+The long-term direction is to extract model behavior labels from real engineering sessions — tendency to skip steps, tool-call accuracy, boundary awareness, sycophantic output, long-range stability. Labels are not for scoring or showing off; they let the orchestration layer choose different task granularity, checkpoints, and review intensity.
 
-这一层称为 `CertifyGate`，目前只保留接口和研究结论，不作为当前插件的隐藏模型评测服务，也不会默认增加额外模型调用。
+This layer is called `CertifyGate`. For now it only keeps the interface and research conclusions; it is not a hidden model-evaluation service in the current plugin, and it does not add extra model calls by default.
 
-## 多宿主使用方式
+## Multi-host usage
 
-首发按多宿主通配设计：统一内核通过宿主适配器接入。当前已实现 OpenCode（hooks + sidecar）与 DeepSeek Harness（原生 Cordis 插件：证据记录 + 破坏性阻断 + 完成闸门）；Claude、Grok、Zcode、Codex、Qoder 等具备可验证 hooks 的宿主进入首发支持面，但每个宿主都必须单独通过能力探针和验收矩阵。没有 hooks 的宿主不进入首发接入承诺。
+The launch is designed host-agnostic: the unified kernel connects through host adapters. Currently implemented: OpenCode (hooks + sidecar) and DeepSeek Harness (native Cordis plugin: evidence recording + destructive-action blocking + completion gate). Claude, Grok, Zcode, Codex, Qoder, and other hosts with verifiable hooks are in the launch support surface, but each host must separately pass its capability probe and acceptance matrix. Hosts without hooks are not in the launch support commitment.
 
-没有 hooks 的宿主怎么办？首发不把它们伪装成已接入。README 和 CLI 只提供一个可复制的 MCP 最小工具集 Prompt，由用户自行转发给该宿主的 Agent：
+What about hosts without hooks? The launch does not fake them as integrated. The README and CLI only provide a copyable minimal MCP toolset prompt, which the user forwards to that host's agent themselves:
 
 ```text
-请在本次任务中使用 IronLaw MCP 的最小工具集：
-1. il_status：开始前读取当前任务状态；
-2. il_check：每次修改或危险命令前提交检查；
-3. il_report：结束前提交实际执行的命令、退出码和未完成项。
-不要把工具返回或自然语言声称当作交付证据；未执行的检查必须标记为未执行。
+For this task, use the IronLaw MCP minimal toolset:
+1. il_status — read current task state before starting;
+2. il_check — submit a check before each change or dangerous command;
+3. il_report — before finishing, submit the commands actually run, exit codes, and open items.
+Do not treat tool returns or natural-language claims as delivery evidence; mark unrun checks as unrun.
 ```
 
-这只是用户自行转发的操作指引，不是宿主适配器、不是自动注入，也不是首发功能支持。只有能够提供可验证 hooks 的宿主，才进入 IronLaw 首发适配矩阵。
+This is only a user-forwarded operating guide, not a host adapter, not automatic injection, and not launch feature support. Only hosts that provide verifiable hooks enter the IronLaw launch adapter matrix.
 
 ```bash
 npx @ironlaw/cli install --host opencode
 npx @ironlaw/cli install --host claude
-# DeepSeek Harness 原生插件：
+# DeepSeek Harness native plugin:
 #   npm install --global @deepseek-ai/dsh
 #   dsh plugin --profile web add @ironlaw/adapter-dsh
 npx @ironlaw/cli doctor
@@ -316,96 +316,88 @@ npx @ironlaw/cli report --last
 npx @ironlaw/cli uninstall --host opencode
 ```
 
-产品模式分为：
+Product modes:
 
-- `Observe`：记录会话、任务和证据，不注入、不阻断、不续写；
-- `Guarded`：启用危险操作阻断、任务锚点、完成闸门和一次最小修复；
-- `Managed`：后续再考虑两轮修复和可选 verifier。
+- `Observe`: record sessions, tasks, and evidence; no injection, no blocking, no continuation;
+- `Guarded`: enable dangerous-action blocking, task anchor, completion gate, and one minimal repair;
+- `Managed`: two-round repair and an optional verifier, considered later.
 
-未知版本、能力探针失败或真实宿主验收未通过时，只能进入 `Observe`，不能把配置写入成功冒充成已启用编排。
+For unknown versions, failed capability probes, or a host that has not passed real acceptance, only `Observe` is allowed; writing config must not be passed off as enabled orchestration.
 
-## 它在效率工程中的位置
+## Where it sits in efficiency engineering
 
-IronLaw 是效率工程的一块基础组件，关注“任务是否按要求一次性交付”，不是完整的编程助手产品。
+IronLaw is one foundational component of efficiency engineering, focused on "does the task get delivered correctly in one shot" — not a complete coding-assistant product.
 
-围绕它还可以形成更大的工程效率组件体系：
-
-```text
-创意
-  → 论证
-  → 规划
-  → 执行
-  → 审查
-  → 交付
-```
-
-可能的其它组件包括：
-
-- 定制化编程工具：面向特定语言、框架、部署环境和企业规范；
-- UnionAgents：多 Agent 联动工作台，负责角色协作、任务分派和结果合并；
-- A2A 通信协议：让不同 Agent、工具和工作台交换任务、状态和证据；
-- 固化创意、论证、规划、执行、审查方法论的工作流组件；
-- 面向团队的报告、指标、回放和工程知识库。
-
-可以把这套组件理解为一条完整的工作方法链：
+Around it, a larger efficiency-engineering component system can form:
 
 ```text
-创意 → 论证 → 规划 → 执行 → 审查 → 交付
-  │       │       │       │       │
-  └─ 受控熵增 ─────┴─ VDDG/边界守恒 ─┴─ IronLaw 完成闸门
+ideation
+  → argumentation
+  → planning
+  → execution
+  → review
+  → delivery
 ```
 
-这些是效率工程生态的其它方向，不属于当前插件的承诺范围。当前只开源 IronLaw Plugin、统一 CLI/协议原型及其必要的本地 sidecar；其它组件是否公开、何时公开，将根据 Hackathon 评委结论和后续产品边界再决定。
+Possible other components include:
 
-## 与 Hackathon 作品的关系
+- custom coding tools for specific languages, frameworks, deployment environments, and enterprise standards;
+- UnionAgents: a multi-agent workbench for role collaboration, task dispatch, and result merging;
+- an A2A protocol for exchanging tasks, state, and evidence between agents, tools, and workbenches;
+- workflow components that freeze the ideation/argumentation/planning/execution/review methodology;
+- team-facing reports, metrics, replay, and engineering knowledge bases.
 
-当前开源插件与 Hackathon 参赛作品是两个边界清晰的交付物：
+This system can be read as one complete working-method chain:
 
-- IronLaw Plugin 是宿主外部的通用交付治理外挂；
-- 它不替代、不打包、不复制 Hackathon 参赛作品；
-- 它不依赖参赛作品的私有代码、数据或运行环境；
-- 它可以独立安装、独立卸载、独立验证；
-- 后续多 Agent 工作台、A2A 协议和方法论组件的安排，待赛事评委结论后再确定。
+```text
+ideation → argumentation → planning → execution → review → delivery
+  │           │              │          │          │
+  └─ controlled entropy ─────┴─ VDDG/boundary conservation ─┴─ IronLaw completion gate
+```
 
-## 当前开源范围
+These are other directions in the efficiency-engineering ecosystem, not part of this plugin's committed scope. Currently only the IronLaw Plugin, the unified CLI/protocol prototype, and its necessary local sidecar are open-sourced; whether and when other components go public depends on the Hackathon judges' conclusion and later product boundaries.
 
-本次公开一个 monorepo（npm workspaces），三个 npm 包：
+## Relationship to the Hackathon entry
+
+The current open-source plugin and the Hackathon entry are two clearly separated deliverables:
+
+- IronLaw Plugin is a host-external, general delivery-governance layer;
+- it does not replace, bundle, or copy the Hackathon entry;
+- it does not depend on the entry's private code, data, or runtime;
+- it can be installed, uninstalled, and verified independently;
+- the arrangement for later multi-agent workbench, A2A protocol, and methodology components waits on the judges' conclusion.
+
+## Current open-source scope
+
+This release publishes one monorepo (npm workspaces) with three npm packages:
 
 ```text
 ironlaw/
-├── packages/cli/          # @ironlaw/cli：install / doctor / status / 通配 sidecar 内核
-├── packages/memory/       # @ironlaw/memory：Git 版本化共享记忆 MCP
-└── packages/adapter-dsh/  # @ironlaw/adapter-dsh：DeepSeek Harness 原生 Cordis 插件
+├── packages/cli/          # @ironlaw/cli: install / doctor / status / host-agnostic sidecar kernel
+├── packages/memory/       # @ironlaw/memory: Git-versioned shared memory MCP
+└── packages/adapter-dsh/  # @ironlaw/adapter-dsh: DeepSeek Harness native Cordis plugin
 ```
 
-目前 monorepo 全量测试 32 项通过（cli 6 + memory 13 + adapter-dsh 13）。这只是协议、本地 sidecar 与 DSH 插件原型证据，不代表所有宿主、所有版本、所有 Provider 或任何任务结果已经验收，也不构成对用户的交付保证。
+The monorepo's full test suite currently passes 32 tests (cli 6 + memory 13 + adapter-dsh 13). This is protocol, local-sidecar, and DSH-plugin prototype evidence only; it does not mean every host, version, provider, or task outcome is accepted, and it is not a delivery guarantee to users.
 
-## 如何判断项目是否成功
+## How to judge whether the project succeeds
 
-不以“模型输出更长”或“测试绿灯更多”为成功标准，而看：
+Success is not "the model outputs more" or "more green tests". It is:
 
-| 指标 | 含义 |
+| Metric | Meaning |
 |---|---|
-| 一次交付率 | 第一次任务运行就通过全部真实验收的比例 |
-| 虚假完成率 | 模型声称完成但硬验收失败的比例 |
-| spec 漂移率 | 最终实现违反或遗漏原始要求的比例 |
-| 有效任务成本 | Provider 总成本 / `VERIFIED` 任务数 |
-| 额外 Token 比 | IronLaw 相对 baseline 的 Token 增幅 |
-| 修复轮收益 | 自动修复后减少的真实验收缺口 |
-| 误阻断率 | 合法工具调用被 IronLaw 错误阻断的比例 |
+| first-pass delivery rate | share of tasks passing all real acceptance on the first run |
+| fake-completion rate | share of tasks the model claims done but hard acceptance fails |
+| spec-drift rate | share of final implementations violating or omitting the original requirement |
+| effective task cost | total provider cost / number of `VERIFIED` tasks |
+| extra-token ratio | IronLaw's token increase relative to baseline |
+| repair-round yield | real acceptance gap closed by auto-repair |
+| false-block rate | share of legitimate tool calls IronLaw wrongly blocks |
 
-如果外挂只能让汇报看起来更完整，却不能提高真实交付率、降低虚假完成率或减少返工，它就不应继续堆叠更多编排角色。
+If the layer only makes reports look more complete without raising real delivery rate, lowering fake-completion rate, or reducing rework, it should not keep stacking more orchestration roles.
 
-## 文档与研究材料
+## License and boundaries
 
-- [OpenCode 外挂实施方案](06-opencode-overlay/README.md)
-- [产品化研究 v0.2](06-opencode-overlay/PRODUCT-RESEARCH-v0.2.md)
-- [分发与安装方案](06-opencode-overlay/DISTRIBUTION-AND-INSTALL.md)
-- [研究索引](INDEX.md)
-- [落地页](00-LANDING.md)
+Before public release, a formal license, third-party dependency list, `SECURITY.md`, and real host acceptance records must be completed. Never commit API keys, OAuth tokens, real sessions, user workspaces, or private provider credentials to the repository.
 
-## 许可与边界
-
-公开发行前需要补齐正式许可证、第三方依赖清单、`SECURITY.md` 和真实宿主验收记录。不得把 API Key、OAuth token、真实会话、用户工作区或私有 Provider 凭据提交到仓库。
-
-IronLaw 与 OpenCode 的关系是第三方插件关系，不代表 OpenCode 官方立场，也不授予任何第三方 Provider 或订阅服务的额外使用权限。
+IronLaw's relationship to OpenCode is that of a third-party plugin; it does not represent OpenCode's official position, and it does not grant any additional usage rights for any third-party provider or subscription service.
