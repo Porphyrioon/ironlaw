@@ -1,0 +1,25 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+Thumbs.db
+*.local
+.env
+.env.*
+!.env.example
+
+# Local agent caches and secrets — never ship these
+.opencode/
+.claude/
+.grok/
+.codex/
+.qoder/
+.zcode/
+auth.json
+*.pem
+*.key
+
+# Runtime state written by the sidecar
+.cache/
+events.ndjson
+state.json
+install-manifest.json

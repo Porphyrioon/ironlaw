@@ -1,0 +1,18 @@
+@ironlaw/memory
+Copyright (c) 2026 IronLaw contributors
+
+IronLaw is one component of an efficiency-engineering toolkit.
+The research scope is efficiency paradigms outside scientific research,
+finance, healthcare, and education.
+
+This product is an independent memory component.
+
+It is not affiliated with, endorsed by, or part of OpenCode, Anthropic,
+xAI, Cursor,
+or any other coding-assistant vendor named in this repository.
+
+Do not reuse those vendors' trademarks, logos, or product names in a way
+that implies official status.
+
+Third-party licenses of dependencies, when published, will be listed here
+with SPDX identifiers. This component has no runtime dependencies.

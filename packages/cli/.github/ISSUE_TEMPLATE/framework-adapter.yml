@@ -1,0 +1,31 @@
+name: 适配器请求
+description: 为某一智能体编程框架增加适配器
+labels: ["adapter"]
+body:
+  - type: input
+    id: framework
+    attributes:
+      label: 智能体编程框架
+    validations:
+      required: true
+  - type: dropdown
+    id: hooks
+    attributes:
+      label: 是否具备可验证 hooks
+      options:
+        - 有，可观察或阻断工具 / 会话事件
+        - 仅有 MCP 或规则入口
+        - 不清楚
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 文档或探测依据
+      description: 请给出官方 hooks / 插件文档链接。
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        不具备 hooks 的框架使用用户可复制的 MCP Prompt，不会自动写入配置。

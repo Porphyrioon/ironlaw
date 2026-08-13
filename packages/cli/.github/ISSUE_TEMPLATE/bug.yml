@@ -1,0 +1,43 @@
+name: Bug
+description: Something IronLaw did or failed to do
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste API keys, tokens, or raw home paths.
+        Security issues go through SECURITY.md, not this form.
+  - type: input
+    id: framework
+    attributes:
+      label: 智能体编程框架
+      placeholder: claude / grok / zcode / …
+    validations:
+      required: true
+  - type: input
+    id: framework_version
+    attributes:
+      label: 框架版本
+      placeholder: output of `<cli> --version`
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output
+      description: Redact paths if needed.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+    validations:
+      required: true

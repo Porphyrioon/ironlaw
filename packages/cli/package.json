@@ -1,0 +1,38 @@
+{
+  "name": "@ironlaw/cli",
+  "version": "0.1.0-alpha.1",
+  "private": false,
+  "description": "IronLaw: an efficiency-engineering plugin and sidecar for agent programming frameworks.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "ironlaw": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "sidecar.js",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node --test tests/fallback-policy.test.js tests/redact.test.js tests/sidecar.test.js",
+    "doctor": "node src/cli.js doctor",
+    "status": "node src/cli.js status"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "ironlaw",
+    "cli",
+    "sidecar",
+    "plugin",
+    "hooks",
+    "coding-agent",
+    "efficiency-engineering"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 360" role="img" aria-labelledby="title desc">
+  <title id="title">效率工程</title>
+  <desc id="desc">效率工程研究非科研、非金融、非医疗、非教育行业的效率范式。IronLaw 把长任务收成可验证的工程过程。</desc>
+  <defs>
+    <filter id="card" x="-4%" y="-6%" width="108%" height="118%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#1C1917" flood-opacity="0.08"/>
+    </filter>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F7F5F0"/>
+      <stop offset="1" stop-color="#EFEBE3"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="960" height="360" rx="20" fill="url(#paper)"/>
+  <rect x="20" y="20" width="920" height="320" rx="16" fill="#FFFcf7" stroke="#E7E2D8"/>
+
+  <text x="48" y="58" font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="13" letter-spacing="2.4" fill="#9A6B2F">EFFICIENCY ENGINEERING</text>
+  <text x="48" y="88" font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="26" font-weight="650" fill="#1C1917">效率工程</text>
+  <text x="48" y="116" font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="14" fill="#57534E">把长任务收成可验证的工程过程</text>
+
+  <g font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">
+    <rect x="520" y="48" width="88" height="28" rx="14" fill="#F5EDE1" stroke="#E4D4B8"/>
+    <text x="564" y="66" text-anchor="middle" fill="#7C5A28">非科研</text>
+    <rect x="616" y="48" width="88" height="28" rx="14" fill="#F5EDE1" stroke="#E4D4B8"/>
+    <text x="660" y="66" text-anchor="middle" fill="#7C5A28">非金融</text>
+    <rect x="712" y="48" width="88" height="28" rx="14" fill="#F5EDE1" stroke="#E4D4B8"/>
+    <text x="756" y="66" text-anchor="middle" fill="#7C5A28">非医疗</text>
+    <rect x="808" y="48" width="88" height="28" rx="14" fill="#F5EDE1" stroke="#E4D4B8"/>
+    <text x="852" y="66" text-anchor="middle" fill="#7C5A28">非教育</text>
+  </g>
+
+  <g filter="url(#card)">
+    <rect x="48" y="148" width="276" height="180" rx="14" fill="#1E3A5F"/>
+  </g>
+  <text x="68" y="178" font-family="ui-sans-serif, system-ui, Segoe UI, sans-serif" font-size="11" letter-spacing="1.6" fill="#C4B08A">THIS REPOSITORY</text>
+  <text x="68" y="208" font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="22" font-weight="650" fill="#FFFcf7">IronLaw</text>
+  <text x="68" y="236" font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="13" fill="#D6C7A8">交付纪律外挂</text>
+  <text x="68" y="268" font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="13" fill="#E8E4DC">事件接入 · 证据账本</text>
+  <text x="68" y="290" font-family="ui-sans-serif, system-ui, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="13" fill="#E8E4DC">完成闸门 · 框架适配</text>
+  <text x="68" y="312" font-family="ui-sans-serif, system-ui, Segoe UI, sans-serif" font-size="12" fill="#C4B08A">@ironlaw/cli</text>
+</svg>

@@ -1,0 +1,16 @@
+{
+  "name": "ironlaw",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "description": "IronLaw: evidence-backed completion and repair layer for coding agents.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

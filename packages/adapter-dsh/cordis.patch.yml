@@ -1,0 +1,14 @@
+# IronLaw bundle for DeepSeek Harness.
+#
+# This is a PATCH OVERLAY: it inserts one plugin row (the IronLaw plugin) into
+# the profile composition. Configuration is read from the environment so the
+# same bundle runs in observe mode by default and enforcer mode when
+# IRONLAW_MODE=enforcer.
+#
+# Enable with:
+#   dsh --patch "$PWD/cordis.patch.yml" web
+# or install as a profile layer:
+#   dsh plugin --profile web add @ironlaw/adapter-dsh
+- insert:
+    - id: ironlaw
+      name: '@ironlaw/adapter-dsh'
