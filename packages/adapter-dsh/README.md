@@ -2,10 +2,10 @@
 
 IronLaw on [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
-IronLaw is a governance and evidence layer for coding agents: it records real
-events, keeps verifiable evidence, and gates "done" on reproducible proof
-rather than the model's own claims. DSH runs the agent; IronLaw proves what the
-agent did and whether it actually finished.
+IronLaw is a DeepSeek Harness orchestration plugin. Built on ordinary coding
+tooling (hooks / sidecar / MCP), it turns thousands of real engineering
+pitfalls into three automated guardrails: block dangerous actions before they
+run, record verifiable evidence as they run, and refuse "done" without proof.
 
 This package is a **native Cordis plugin**, not an MCP bridge. It hangs off the
 DSH extension points themselves.
