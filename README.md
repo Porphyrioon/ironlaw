@@ -396,8 +396,3 @@ Success is not "the model outputs more" or "more green tests". It is:
 
 If the layer only makes reports look more complete without raising real delivery rate, lowering fake-completion rate, or reducing rework, it should not keep stacking more orchestration roles.
 
-## License and boundaries
-
-Before public release, a formal license, third-party dependency list, `SECURITY.md`, and real host acceptance records must be completed. Never commit API keys, OAuth tokens, real sessions, user workspaces, or private provider credentials to the repository.
-
-IronLaw's relationship to OpenCode is that of a third-party plugin; it does not represent OpenCode's official position, and it does not grant any additional usage rights for any third-party provider or subscription service.
