@@ -105,10 +105,11 @@ function respondError(id, code, message) {
 }
 
 // This is a legacy MCP server (initialize/tools/list/tools/call over stdio).
-// It accepts the legacy protocol line (2024-10-07 through 2025-06-18) and
-// rejects 2026-07-28 modern (server/discover + per-request metadata) and any
+// It accepts the legacy protocol line (2024-10-07 through 2025-11-25; the
+// latter is the @modelcontextprotocol/sdk 1.30.x default) and rejects the
+// 2026-07-28 modern line (server/discover + per-request metadata) and any
 // unknown/fictional version rather than echoing it as if supported.
-const LEGACY_PROTOCOL_VERSIONS = new Set(["2024-10-07", "2024-11-05", "2025-03-26", "2025-06-18"])
+const LEGACY_PROTOCOL_VERSIONS = new Set(["2024-10-07", "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
 
 function callTool(name, args) {
   switch (name) {
