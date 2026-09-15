@@ -1,0 +1,33 @@
+{
+  "provenance": "Synthetic event history frozen for P3 regression; not a captured user/model production trajectory",
+  "slices": [
+    {
+      "id": "repair-after-config-change", "task_id": "repair", "source_ref": "fixture:p3-v1", "budget_units": 10,
+      "roots": { "goals": ["goal"], "constraints": ["hard"], "pending_steps": ["step"] },
+      "entries": [
+        { "id": "goal", "sequence": 1, "text": "Repair the launcher", "units": 1, "similarity": 0.1, "dependencies": [] },
+        { "id": "hard", "sequence": 2, "text": "Do not publish", "units": 2, "similarity": 0.2, "dependencies": [] },
+        { "id": "old", "sequence": 3, "text": "Tests passed on v1", "units": 1, "similarity": 0.99, "dependencies": [], "state": { "key": "test", "value": "passed", "version": "v1" } },
+        { "id": "version", "sequence": 4, "text": "Configuration changed to v2", "units": 2, "similarity": 0.3, "dependencies": [] },
+        { "id": "proof", "sequence": 5, "text": "v2 launcher check failed; retain failure reason", "units": 3, "similarity": 0.4, "dependencies": ["version"], "state": { "key": "test", "value": "failed", "version": "v2" }, "evidence": { "ref": "result:5", "version": "v2", "readable": true } },
+        { "id": "step", "sequence": 6, "text": "Investigate failure using current proof", "units": 2, "similarity": 0.5, "dependencies": ["proof"] },
+        { "id": "noise1", "sequence": 7, "text": "Working", "units": 1, "similarity": 0.98, "dependencies": [] },
+        { "id": "noise2", "sequence": 8, "text": "Still working", "units": 1, "similarity": 0.97, "dependencies": [] },
+        { "id": "noise3", "sequence": 9, "text": "Checking", "units": 1, "similarity": 0.96, "dependencies": [] }
+      ],
+      "oracle": { "constraints": ["hard"], "critical": ["goal", "hard", "version", "proof", "step"], "states": [{ "key": "test", "value": "failed", "version": "v2" }], "evidence": [{ "ref": "result:5", "version": "v2" }] }
+    },
+    {
+      "id": "research-missing-archive", "task_id": "research", "source_ref": "fixture:p3-v1", "budget_units": 6,
+      "roots": { "goals": ["goal"], "constraints": ["hard"], "pending_steps": ["step"] },
+      "entries": [
+        { "id": "goal", "sequence": 1, "text": "Explain excluded alternative", "units": 1, "similarity": 0.1, "dependencies": [] },
+        { "id": "hard", "sequence": 2, "text": "Separate unknown from confirmed", "units": 1, "similarity": 0.2, "dependencies": [] },
+        { "id": "proof", "sequence": 3, "text": "Archive unavailable", "units": 2, "similarity": 0.3, "dependencies": [], "state": { "key": "source", "value": "unknown", "version": "v2" }, "evidence": { "ref": "archive:3", "version": "v2", "readable": false } },
+        { "id": "step", "sequence": 4, "text": "Report missing source", "units": 2, "similarity": 0.4, "dependencies": ["proof"] },
+        { "id": "old", "sequence": 5, "text": "Old summary said confirmed", "units": 1, "similarity": 0.99, "dependencies": [], "state": { "key": "source", "value": "confirmed", "version": "v1" } }
+      ],
+      "oracle": { "constraints": ["hard"], "critical": ["goal", "hard", "proof", "step"], "states": [{ "key": "source", "value": "unknown", "version": "v2" }], "evidence": [{ "ref": "archive:3", "version": "v2" }] }
+    }
+  ]
+}
