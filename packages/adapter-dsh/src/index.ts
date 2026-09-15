@@ -17,7 +17,7 @@ export interface IronLawConfig {
    * candidate/body consistency, fingerprints and requirement checks here.
    * Without it the adapter explicitly reports unknown, with bounded feedback. */
   resolveAudit?: (context: { session_id: string; turn: number; task: TaskContract;
-    response: string; records: EvidenceRecord[] }) => Omit<AuditInput, 'previous'>
+    response: string; records: EvidenceRecord[]; recovery: ReturnType<EvidenceLedger['recover']> }) => Omit<AuditInput, 'previous'>
 }
 function sessionIdOf(agent: { session?: { id?: unknown } } | undefined): string {
   const id = agent?.session?.id
@@ -89,7 +89,8 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     const sessionId = sessionIdOf(agent), task = taskFor(sessionId)
     const response = responses.get(sessionId) ?? { text: '', seq: -1 }
     const records = ledger.snapshot(sessionId)
-    const input: Omit<AuditInput, 'previous'> = config.resolveAudit?.({ session_id: sessionId, turn, task, response: response.text, records }) ?? {
+    const input: Omit<AuditInput, 'previous'> = config.resolveAudit?.({ session_id: sessionId, turn, task, response: response.text, records,
+      recovery: ledger.recover(sessionId) }) ?? {
       request_id: `${sessionId}:${turn}:${response.seq}`, task,
       candidate: { claims_success: true, response_kind: 'final_delivery', text: response.text, requirement_claims: [] },
       candidate_check: { status: 'unknown', source_ref: '' }, evidence: [], hard_constraints_checked: [],
@@ -124,3 +125,8 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
 // Public protocol types and host-side fingerprint utility.
 export type { TaskContract, Requirement, Candidate, Verification, Decision, AuditState, AuditInput, RecoveryEvent, HardConstraintCheck, Verdict } from './audit.js'
 export { objectVersionDigest } from './fingerprint.js'
+export { EvidenceLedger } from './evidence.js'
+export { ContextStore, retainCapsule } from './context.js'
+export type { ContextEntry, ContextStructure, ContextSummary, TaskCapsule, RetentionCapsule, ArchiveIndex, ContextVersion } from './context.js'
+export { AdmissionController } from './aci.js'
+export type { AdmissionEntry, AdmissionBudget, AdmissionRenderer, AdmissionResult } from './aci.js'

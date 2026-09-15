@@ -1,5 +1,6 @@
 ﻿import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { openSync, closeSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { sanitizeEvidence } from './redact.js'
@@ -38,11 +39,23 @@ export class EvidenceLedger {
     }
   }
   record(sessionId: string, type: string, payload: unknown, link: Association = {}): EvidenceRecord {
+    return this.withLock(() => {
+      this.records = new EvidenceLedger(this.root).records
+      return this.append(sessionId, type, payload, link)
+    })
+  }
+  /** Shared with context commit: no append between final validation and pointer swap. */
+  withLock<T>(action: () => T): T {
+    const file = join(this.root, 'events.lock'), fd = openSync(file, 'wx')
+    try { return action() } finally { closeSync(fd); unlinkSync(file) }
+  }
+  private append(sessionId: string, type: string, payload: unknown, link: Association): EvidenceRecord {
     if (link.event_id) {
       const existing = this.records.find(r => r.event_id === link.event_id)
       if (existing) {
         if (existing.session_id !== sessionId || existing.type !== type
-          || JSON.stringify(existing.payload) !== JSON.stringify(safeJson(payload))) throw new Error('evidence_event_id_conflict')
+          || JSON.stringify(existing.payload) !== JSON.stringify(safeJson(payload))
+          || Object.entries(link).some(([key, value]) => JSON.stringify(existing[key as keyof EvidenceRecord]) !== JSON.stringify(value))) throw new Error('evidence_event_id_conflict')
         return existing
       }
     }
@@ -71,7 +84,8 @@ export class EvidenceLedger {
     const groups = new Map<string, { tool_call_id: string; status: Status; call?: EvidenceRecord; result?: EvidenceRecord }>()
     for (const r of this.snapshot(sessionId)) {
       if (!r.tool_call_id || !['tool.call', 'tool.result'].includes(r.type)) continue
-      const key = JSON.stringify([r.task_id, r.tool_call_id])
+      if (r.schema_version !== 2) continue
+      const key = JSON.stringify([r.task_id, r.objective_revision, r.tool_call_id])
       const item = groups.get(key) ?? { tool_call_id: r.tool_call_id, status: 'unknown' as Status }
       if (r.type === 'tool.call') item.call = r
       else item.result = r
@@ -83,5 +97,15 @@ export class EvidenceLedger {
   verifications(sessionId: string, taskId: string): Verification[] {
     return this.snapshot(sessionId).filter(r => r.schema_version === 2 && r.task_id === taskId
       && r.type === 'requirement.verification').map(r => r.payload as Verification)
+  }
+  /** Re-open the durable log, never reconstruct authority or proof from a summary. */
+  recover(sessionId: string) {
+    const durable = new EvidenceLedger(this.root)
+    const records = durable.snapshot(sessionId)
+    const task = durable.task(sessionId)
+    return { records, event_sequence: records.length, task,
+      audit: task ? durable.auditState(sessionId, task.task_id) : undefined,
+      evidence: task ? durable.verifications(sessionId, task.task_id) : [],
+      calls: durable.calls(sessionId) }
   }
 }
