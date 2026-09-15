@@ -1,6 +1,5 @@
-﻿import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs'
+﻿import { appendFileSync, mkdirSync, readFileSync, existsSync, statSync, openSync, readSync, closeSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { openSync, closeSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { sanitizeEvidence } from './redact.js'
@@ -23,26 +22,68 @@ function safeJson(value: unknown): unknown {
 export class EvidenceLedger {
   readonly root: string
   private records: EvidenceRecord[] = []
+  /** event_id -> first record with that id; makes idempotency/conflict checks O(1). */
+  private index = new Map<string, EvidenceRecord>()
+  /** Byte offset of events.ndjson already loaded into memory; appends read only past it. */
+  private offset = 0
   constructor(root?: string) {
     this.root = root ?? process.env.IRONLAW_EVIDENCE_ROOT ?? join(homedir(), '.ironlaw')
     mkdirSync(this.root, { recursive: true })
     const file = join(this.root, 'events.ndjson')
     if (existsSync(file)) {
-      const raw = readFileSync(file, 'utf8')
+      const buf = readFileSync(file)
+      this.offset = buf.byteLength
+      const raw = buf.toString('utf8')
       const lines = raw.split('\n')
       for (let i = 0; i < lines.length; i++) {
         if (!lines[i].trim()) continue
-        try { this.records.push(JSON.parse(lines[i])) }
+        try { this.ingest(JSON.parse(lines[i])) }
         catch { throw new Error('evidence_ledger_corrupt') }
       }
-      if (raw && !raw.endsWith('\n')) appendFileSync(file, '\n')
+      if (raw && !raw.endsWith('\n')) { appendFileSync(file, '\n'); this.offset += 1 }
     }
+  }
+  private ingest(record: EvidenceRecord): void {
+    this.records.push(record)
+    const id = record && typeof record === 'object' ? record.event_id : undefined
+    if (typeof id === 'string' && !this.index.has(id)) this.index.set(id, record)
   }
   record(sessionId: string, type: string, payload: unknown, link: Association = {}): EvidenceRecord {
     return this.withLock(() => {
-      this.records = new EvidenceLedger(this.root).records
+      this.readTail()
       return this.append(sessionId, type, payload, link)
     })
+  }
+  /** Fold in records other writers appended since this.offset; tolerate a torn trailing line. */
+  private readTail(): void {
+    const file = join(this.root, 'events.ndjson')
+    if (!existsSync(file)) return
+    const size = statSync(file).size
+    if (size <= this.offset) return
+    const chunk = this.readTailBytes(file, this.offset, size - this.offset).toString('utf8')
+    const lastNewline = chunk.lastIndexOf('\n')
+    if (lastNewline === -1) return
+    const complete = chunk.slice(0, lastNewline)
+    for (const line of complete.split('\n')) {
+      if (!line.trim()) continue
+      try { this.ingest(JSON.parse(line)) }
+      catch { throw new Error('evidence_ledger_corrupt') }
+    }
+    this.offset += Buffer.byteLength(complete, 'utf8') + 1
+  }
+  /** Seam for tests to count bytes read; reads only [position, position+length). */
+  private readTailBytes(file: string, position: number, length: number): Buffer {
+    const fd = openSync(file, 'r')
+    try {
+      const buf = Buffer.allocUnsafe(length)
+      let read = 0
+      while (read < length) {
+        const n = readSync(fd, buf, read, length - read, position + read)
+        if (n <= 0) break
+        read += n
+      }
+      return buf.subarray(0, read)
+    } finally { closeSync(fd) }
   }
   /** Shared with context commit: no append between final validation and pointer swap. */
   withLock<T>(action: () => T): T {
@@ -51,7 +92,7 @@ export class EvidenceLedger {
   }
   private append(sessionId: string, type: string, payload: unknown, link: Association): EvidenceRecord {
     if (link.event_id) {
-      const existing = this.records.find(r => r.event_id === link.event_id)
+      const existing = this.index.get(link.event_id)
       if (existing) {
         if (existing.session_id !== sessionId || existing.type !== type
           || JSON.stringify(existing.payload) !== JSON.stringify(safeJson(payload))
@@ -67,8 +108,10 @@ export class EvidenceLedger {
       started_at: null, ended_at: null, collector_version: 'ironlaw/2.0-p1',
       ...link, type, payload: safeJson(payload), occurred_at: new Date().toISOString(),
     }
-    appendFileSync(join(this.root, 'events.ndjson'), `${JSON.stringify(record)}\n`)
-    this.records.push(record)
+    const line = `${JSON.stringify(record)}\n`
+    appendFileSync(join(this.root, 'events.ndjson'), line)
+    this.ingest(record)
+    this.offset += Buffer.byteLength(line, 'utf8')
     return record
   }
   snapshot(sessionId: string): EvidenceRecord[] { return structuredClone(this.records.filter(r => r.session_id === sessionId)) }
