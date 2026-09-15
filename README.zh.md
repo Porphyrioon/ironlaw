@@ -288,6 +288,32 @@ Hackathon 方案里讨论的铁律，不是再写一段更长的 system prompt�
 
 这一层称为 `CertifyGate`，目前只保留接口和研究结论，不作为当前插件的隐藏模型评测服务，也不会默认增加额外模型调用。
 
+## IronLaw 2.0：证据裁决
+
+### 研发原理
+
+完成闸门不再问"这一轮有没有调用工具"，而是问一个更窄的问题：当前任务**每一项适用验收项，是否都有仍然有效的证据**？工具调用、模型自报、摘要都回答不了这个问题，只有宿主观察到的事实能回答。约束对象因此从"轮"移到"任务"，上下文管理也改为服从这一任务状态，而不是按固定周期重写。
+
+### 实现
+
+闸门是一个纯裁决器，输出六态（`allow_response`、`verified_complete`、`repair_required`、`incomplete`、`blocked`、`cancelled`），由版本化任务契约、显式 `claims_success` 输入、硬约束检查，以及以对象/上下文指纹（而非轮次）为键的有界修复计数器驱动。
+
+它的可信边界是一个 `resolveAudit` resolver，只从持久化宿主事件装配裁决输入：
+
+- **候选核对**：候选正文与宿主记录的 agent 最终消息比对；没有记录就保持 `unknown`、失败关闭。
+- **证据**：每个完整的 `tool.call` / `tool.result` 配对（用原生调用 ID 对齐）产生一条 `host_verifier` 证明。半配对、或来源为 model/summary 的记录，永不作为证明。
+- **相关性**：只有命令属于验证类调用（test/build/lint/typecheck 等运行器，保守白名单、失败关闭）且退出码未被屏蔽地到达宿主时，结果才作为验收证据。`echo`、`ls`、`cat` 与读取操作不能验证任何东西；`npm test || true` 与 `npm test; true` 被拒（尾段吃掉了退出码），而前导的 `cd x && npm test` 保留。
+
+与之配套实现了上下文治理：三阶段压缩事务（准备/验证/提交，含 fsync、回读、原子指针替换与回退指针）、可恢复归档索引、从追加式 NDJSON 账本恢复，以及受最终渲染 token 预算约束的入场控制。
+
+### 验证
+
+monorepo 全量测试 107 项通过（adapter-dsh 88、cli 6、memory 13），`npm run typecheck` 干净。resolver 的形态由两个对抗探针塑造——它自己的测试看不到自己没想到的攻击面：一个"无关命令"探针发现早期版本对"改文件 + 任意 exit-0 命令"就判 `verified_complete`；一个"退出码屏蔽"探针发现 `npm test || true` 在测试失败时也判 `verified_complete`。两者现已拦截并有测试覆盖。
+
+### 效果
+
+resolver 到位后，有真实未屏蔽验证运行的任务被放行，没有的则进入修复而不是被盖章通过；上面两条假成功路径已封死。残留边界如实标注而非隐藏：子 shell 分组按保守处理（失败关闭）；单个 `&` 后台运行尚未归类为屏蔽；一条验证命令目前关联到全部适用验收项，而非逐项绑定。
+
 ## 多宿主使用方式
 
 首发按多宿主通配设计：统一内核通过宿主适配器接入。当前已实现 OpenCode（hooks + sidecar）与 DeepSeek Harness（原生 Cordis 插件：证据记录 + 破坏性阻断 + 完成闸门）；Claude、Grok、Zcode、Codex、Qoder 等具备可验证 hooks 的宿主进入首发支持面，但每个宿主都必须单独通过能力探针和验收矩阵。没有 hooks 的宿主不进入首发接入承诺。
@@ -378,7 +404,7 @@ ironlaw/
 └── packages/adapter-dsh/  # @ironlaw/adapter-dsh：DeepSeek Harness 原生 Cordis 插件
 ```
 
-目前 monorepo 全量测试 32 项通过（cli 6 + memory 13 + adapter-dsh 13）。这只是协议、本地 sidecar 与 DSH 插件原型证据，不代表所有宿主、所有版本、所有 Provider 或任何任务结果已经验收，也不构成对用户的交付保证。
+目前 monorepo 全量测试 107 项通过（cli 6 + memory 13 + adapter-dsh 88）。这只是协议、本地 sidecar 与 DSH 插件原型证据，不代表所有宿主、所有版本、所有 Provider 或任何任务结果已经验收，也不构成对用户的交付保证。
 
 ## 如何判断项目是否成功
 

@@ -288,6 +288,32 @@ The long-term direction is to extract model behavior labels from real engineerin
 
 This layer is called `CertifyGate`. For now it only keeps the interface and research conclusions; it is not a hidden model-evaluation service in the current plugin, and it does not add extra model calls by default.
 
+## IronLaw 2.0: evidence-based completion
+
+### Design principle
+
+The completion gate no longer asks "did the agent call a tool this round". It asks a narrower question: does every applicable acceptance item of the current task have still-valid evidence? A tool call, a model claim, or a summary cannot answer that; only host-observed facts can. The constraint object moves from the turn to the task, and context management is made to follow that task state instead of a fixed rewrite schedule.
+
+### Implementation
+
+The gate is a pure adjudicator with six verdicts (`allow_response`, `verified_complete`, `repair_required`, `incomplete`, `blocked`, `cancelled`), driven by a versioned task contract, an explicit `claims_success` input, hard-constraint checks, and a bounded repair counter keyed on object/context digests rather than turn ids.
+
+Its trusted boundary is a `resolveAudit` resolver that assembles the verdict input from durable host events only:
+
+- **candidate check** — the candidate body is compared against the agent's final message as durably recorded; with no record it stays `unknown` and fails closed.
+- **evidence** — one `host_verifier` proof per complete `tool.call` / `tool.result` pair, paired by native call id. A half pair, or a model/summary-sourced record, is never proof.
+- **relevance** — a result counts as acceptance evidence only when the command is a verification-class invocation (test/build/lint/typecheck runners, a conservative whitelist that fails closed) and its exit code reaches the host unmasked. `echo`, `ls`, `cat` and reads verify nothing; `npm test || true` and `npm test; true` are rejected because the trailing segment eats the exit code; a leading `cd x && npm test` is kept.
+
+Context governance is implemented alongside: a three-phase compaction transaction (prepare / validate / commit with fsync, read-back, atomic pointer swap and a rollback pointer), a recoverable archive index, ledger recovery from the append-only NDJSON log, and admission control under a final-render token budget.
+
+### Verification
+
+The monorepo suite passes 107 tests (adapter-dsh 88, cli 6, memory 13) with a clean `npm run typecheck`. Two adversarial probes shaped the resolver, because its own tests could not see attacks it had not imagined: an unrelated-command probe showed a first version granting `verified_complete` for a file change plus any exit-0 command, and an exit-code masking probe showed `npm test || true` granting `verified_complete` even when the test failed. Both are now blocked and covered by tests.
+
+### Effect
+
+With the resolver in place, a task with a real unmasked verification run is accepted, and a task without one is repaired instead of rubber-stamped; the two false-success paths above are closed. Remaining boundaries are documented rather than hidden: subshell grouping is treated conservatively (fails closed), a single `&` background run is not yet classified as masking, and a verification command is currently associated with all applicable acceptance items rather than a per-item check binding.
+
 ## Multi-host usage
 
 The launch is designed host-agnostic: the unified kernel connects through host adapters. Currently implemented: OpenCode (hooks + sidecar) and DeepSeek Harness (native Cordis plugin: evidence recording + destructive-action blocking + completion gate). Claude, Grok, Zcode, Codex, Qoder, and other hosts with verifiable hooks are in the launch support surface, but each host must separately pass its capability probe and acceptance matrix. Hosts without hooks are not in the launch support commitment.
@@ -378,7 +404,7 @@ ironlaw/
 └── packages/adapter-dsh/  # @ironlaw/adapter-dsh: DeepSeek Harness native Cordis plugin
 ```
 
-The monorepo's full test suite currently passes 32 tests (cli 6 + memory 13 + adapter-dsh 13). This is protocol, local-sidecar, and DSH-plugin prototype evidence only; it does not mean every host, version, provider, or task outcome is accepted, and it is not a delivery guarantee to users.
+The monorepo's full test suite currently passes 107 tests (cli 6 + memory 13 + adapter-dsh 88). This is protocol, local-sidecar, and DSH-plugin prototype evidence only; it does not mean every host, version, provider, or task outcome is accepted, and it is not a delivery guarantee to users.
 
 ## How to judge whether the project succeeds
 
