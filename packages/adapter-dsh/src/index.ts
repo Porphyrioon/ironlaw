@@ -8,6 +8,19 @@ import { destructiveReason } from './policy.js'
 import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
 import { defaultResolveAudit } from './resolver.js'
 import { classifyTaskType } from './classify.js'
+import { snapshotObjectVersion, touchedPathsOf } from './snapshot.js'
+
+/**
+ * The declared contract. Applicability and authorization found while adjudicating one revision
+ * are per-turn facts: persisting them let a discussion exemption survive into a later code task
+ * and excuse it from evidence entirely. Only what the human gave us is stored.
+ */
+function declared(task: TaskContract): TaskContract {
+  return { ...task, requirements: task.requirements.map(r => {
+    const { exclusion: _exclusion, ...rest } = r as TaskContract['requirements'][number] & { exclusion?: unknown }
+    return { ...rest, applicability: 'unknown' as const, status: 'unknown' as const }
+  }) }
+}
 
 /**
  * An id for a record whose payload is re-derived from current state: the content is folded
@@ -84,14 +97,30 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     }
   }
   const responses = new Map<string, { text: string; seq: number }>()
-  const taskFor = (sessionId: string): TaskContract => ledger.task(sessionId) ?? {
+  /**
+   * Files this session has named so far, per session. Kept so that a tool result can be pinned
+   * to the object version that existed WHEN IT RAN: re-deriving the digest at adjudication time
+   * instead re-bound a passing run to whatever the tree had become since, which defeated the
+   * invalidation the digest comparison exists to provide.
+   */
+  const touched = new Map<string, Set<string>>()
+  const rememberTouched = (sessionId: string, toolName: string, args: unknown): void => {
+    const paths = touchedPathsOf(toolName, args)
+    if (!paths.length) return
+    const set = touched.get(sessionId) ?? new Set<string>()
+    for (const path of paths) set.add(path)
+    touched.set(sessionId, set)
+  }
+  const taskFor = (sessionId: string): TaskContract => declared(ledger.task(sessionId) ?? {
     schema_version: 2, task_id: `unresolved:${sessionId}`, objective_revision: 1,
     source_ref: `session:${sessionId}`, scope: ['unresolved'], status: 'active',
     requirements: [{ requirement_id: 'AC-1', class: 'acceptance', source_kind: 'user_instruction',
       source_ref: '', applicability: 'unknown', status: 'unknown' }],
-  }
+  })
   ctx.on('tools/pre-execute', async (exec, next) => {
-    ledger.record(sessionIdOf(exec.agent), 'tool.execute.before', { name: exec.name, arguments: exec.arguments })
+    const sessionId = sessionIdOf(exec.agent)
+    rememberTouched(sessionId, exec.name, exec.arguments)
+    ledger.record(sessionId, 'tool.execute.before', { name: exec.name, arguments: exec.arguments })
     return next()
   })
   if (mode === 'enforcer') ctx.tools.guard(exec => {
@@ -101,15 +130,17 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
   })
   ctx.on('tools/result', (exec, result) => {
     const sessionId = sessionIdOf(exec.agent)
+    rememberTouched(sessionId, exec.name, exec.arguments)
     ledger.record(sessionId, 'tool.execute.after', { name: exec.name, isError: result.isError })
     // Persist the canonical outcome under its own record type, keyed by call id. The
-    // tool.call/tool.result pairing written by the session event stream is left
-    // untouched; this only adds the exit code that stream never carries.
+    // tool.call/tool.result pairing written by the session event stream is left untouched;
+    // this adds the exit code that stream never carries, plus the object version as of now.
     const exitCode = canonicalExitCode(result.isError ? undefined : result.value)
     const command = canonicalCommand(exec.arguments)
     const callId = typeof exec.callId === 'string' ? exec.callId : ''
-    if (!callId || (exitCode === null && !command)) return
-    const outcome = { tool_call_id: callId, name: exec.name, command, exit_code: exitCode, is_error: result.isError }
+    const objectDigest = snapshotObjectVersion(touched.get(sessionId) ?? [])
+    if (!callId || (exitCode === null && !command && !objectDigest)) return
+    const outcome = { tool_call_id: callId, name: exec.name, command, exit_code: exitCode, is_error: result.isError, object_version_digest: objectDigest }
     const outcomeLink = { tool_call_id: callId, exit_code: exitCode }
     recordDerived(sessionId, 'tool.outcome', outcome,
       { ...outcomeLink, event_id: versionedId(`dsh:${sessionId}:outcome:${callId}`, outcome, outcomeLink) })
@@ -119,6 +150,9 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     const eventId = `dsh:${session.id}:${event.seq}`
     if (ledger.hasEvent(session.id, eventId)) return
     const data = event.data as any
+    // The session stream is the other place a call's arguments appear; a fixture or a host
+    // that only drives events must still feed the object scope used when pinning results.
+    if (event.type === 'tool/call') rememberTouched(session.id, typeof data.name === 'string' ? data.name : '', data.arguments)
     let task = taskFor(session.id)
     // Only actual human messages revise the contract. Synthetic feedback retains provenance.
     if (event.type === 'user/message' && data.source?.kind === 'user') {
@@ -175,7 +209,10 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     }
     const replayed = previous && Object.hasOwn(previous.replay, input.request_id)
     const { decision, state } = auditTurn({ ...input, previous })
-    ledger.record(sessionId, 'task.contract', { ...input.task, status: state.task_status }, { task_id: input.task.task_id, objective_revision: input.task.objective_revision })
+    // Persist the DECLARED contract, not the resolver's per-turn transform: applicability and
+    // authorization are re-derived each revision, and storing them let a discussion exemption
+    // outlive the discussion and excuse a later code task from evidence.
+    ledger.record(sessionId, 'task.contract', { ...declared(input.task), status: state.task_status }, { task_id: input.task.task_id, objective_revision: input.task.objective_revision })
     for (const proof of input.evidence) recordDerived(sessionId, 'requirement.verification', proof, {
       event_id: proof.event_id, task_id: proof.task_id, objective_revision: proof.objective_revision,
       requirement_ids: proof.requirement_ids, tool_call_id: proof.tool_call_id ?? null,

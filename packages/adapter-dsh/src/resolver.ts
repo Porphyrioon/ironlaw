@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type { EvidenceLedger, EvidenceRecord } from './evidence.js'
 import { objectVersionDigest } from './fingerprint.js'
 import { classifyTaskType, isTaskType, hostReadable, type TaskType } from './classify.js'
+import { SHELL_TOOL, readableRegularFiles, shellWriteTargets } from './snapshot.js'
 import type { AuditInput, Candidate, HardConstraintCheck, Status, TaskContract, Verification } from './audit.js'
 
 /**
@@ -52,34 +53,6 @@ const stemOf = (base: string): string => base.replace(/\.[^.]+$/, '')
 const slashOf = (path: string): string => path.replace(/\\/g, '/').toLowerCase()
 
 /** Shell tools whose command text can name a file they wrote. */
-const SHELL_TOOL = /^(?:pwsh|powershell|bash|sh|dash|zsh|ksh|fish|csh|tcsh|cmd)$/i
-/**
- * Paths a shell command writes to. A shell-mediated edit leaves no diff meta, so it was both
- * outside the object scope (an empty digest turned every acceptance item into
- * `evidence_stale`) and unable to answer a docs request. Only explicit write constructs
- * count, and every candidate is later required to be a host-readable regular file, so a path
- * that merely appears inside quoted text cannot enter the scope.
- */
-function shellWriteTargets(command: string): string[] {
-  const out = new Set<string>()
-  const clean = (token: string): string => token.replace(/^["']+|["']+$/g, '')
-  for (const m of command.matchAll(/(?:^|[^&>])>>?\s*("[^"]+"|'[^']+'|[^\s;&|<>]+)/g)) {
-    const target = clean(m[1])
-    if (target && !/^&\d*$/.test(target)) out.add(target)
-  }
-  for (const m of command.matchAll(/\b(?:tee|Set-Content|Add-Content|Out-File)\b([^\n;&|]*)/gi))
-    for (const token of m[1].trim().split(/\s+/)) {
-      const target = clean(token)
-      if (target && !target.startsWith('-')) out.add(target)
-    }
-  for (const m of command.matchAll(/\bsed\b[^\n;&|]*?\s-i\S*\s+([^\n;&|]*)/gi)) {
-    const operands = m[1].trim().split(/\s+/).map(clean).filter(t => t && !t.startsWith('-'))
-    const target = operands.at(-1)
-    if (target) out.add(target)
-  }
-  return [...out]
-}
-
 /**
  * Affected paths: DSH diff metas (mutations report `card:'diff'` with `diffs[].path`),
  * `meta.locations`, plus the path-like arguments of any tool call. Reads and searches are
@@ -229,12 +202,18 @@ const VERIFIER_PATTERNS: RegExp[] = [
  * by `||`) can yield aggregate exit 0 despite a real failure, so it also returns
  * false. `&&` neighbours are kept: a failure short-circuits and propagates.
  */
+/** A verifier asked for its own help or version runs nothing, whatever its exit code says. */
+const HELP_OR_VERSION = /(?:^|\s)(?:--help|-h|--version|-V|-v)(?:\s|$)/
+
 function isTrustworthyVerification(cmd: string, dialect: ShellDialect): boolean {
   if (!cmd || !cmd.trim()) return false
   const masking = MASKING_CONN[dialect]
   const { segs, conns } = splitShellSegments(cmd)
   const norm = segs.map(s => s.trim().replace(LEAD_STRIP, '').trim())
-  const verifiers = norm.map((s, i) => (s && VERIFIER_PATTERNS.some(re => re.test(s)) ? i : -1)).filter(i => i >= 0)
+  // `npm test --help` / `--version` exit 0 without running anything: a verifier asked for its
+  // own help or version is not a verification, and the exit code cannot say otherwise.
+  const verifiers = norm.map((s, i) => (s && VERIFIER_PATTERNS.some(re => re.test(s)) && !HELP_OR_VERSION.test(s) ? i : -1))
+    .filter(i => i >= 0)
   if (!verifiers.length) return false
   return verifiers.every(v => {
     for (let i = v; i < conns.length; i++) if (masking.has(conns[i])) return false
@@ -242,15 +221,19 @@ function isTrustworthyVerification(cmd: string, dialect: ShellDialect): boolean 
   })
 }
 
-/** True when any connector could eat a failure in this dialect, so the aggregate exit no longer reflects the operation. */
-function hasMaskedExit(cmd: string, dialect: ShellDialect): boolean {
+/** True when any connector could eat a failure in this dialect, so the aggregate exit no longer reflects the operation. */function hasMaskedExit(cmd: string, dialect: ShellDialect): boolean {
   if (!cmd || !cmd.trim()) return false
   const masking = MASKING_CONN[dialect]
   return splitShellSegments(cmd).conns.some(c => masking.has(c))
 }
 
-/** One durable canonical outcome recorded by the host's `tools/result` hook. */
-interface CallOutcome { exit: number; cmd: string }
+/**
+ * One durable canonical outcome recorded by the host's `tools/result` hook. `digest` is the
+ * object version as it stood when the tool ran — the fact a proof attests. It is captured, not
+ * recomputed: re-deriving it at adjudication time re-bound an old passing run to whatever the
+ * tree had become since, which is exactly the invalidation the digest exists to provide.
+ */
+interface CallOutcome { exit: number; cmd: string; digest: string }
 
 /**
  * Canonical outcomes by call id. A real DSH session puts the exit code only in the
@@ -268,7 +251,28 @@ function outcomesByCallId(ctx: ResolveAuditContext): Map<string, CallOutcome> {
       : typeof (r.payload as any)?.exit_code === 'number' ? (r.payload as any).exit_code : null
     if (exit === null) continue
     const cmd = (r.payload as any)?.command
-    out.set(id, { exit, cmd: typeof cmd === 'string' ? cmd : '' })
+    const digest = typeof r.object_version_digest === 'string' && r.object_version_digest
+      ? r.object_version_digest
+      : typeof (r.payload as any)?.object_version_digest === 'string' ? (r.payload as any).object_version_digest : ''
+    out.set(id, { exit, cmd: typeof cmd === 'string' ? cmd : '', digest })
+  }
+  return out
+}
+
+/**
+ * Captured object version per call id, for every tool result — including calls that carry no
+ * exit code, such as a write tool: that result is still a moment at which the object version
+ * was observed, and a proof about the written file must speak for that moment.
+ */
+function digestsByCallId(ctx: ResolveAuditContext): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const r of ctx.records) {
+    if (r.type !== 'tool.outcome') continue
+    const id = r.tool_call_id
+    if (typeof id !== 'string' || !id) continue
+    const digest = typeof r.object_version_digest === 'string' && r.object_version_digest ? r.object_version_digest
+      : typeof (r.payload as any)?.object_version_digest === 'string' ? (r.payload as any).object_version_digest : ''
+    if (digest) out.set(id, digest)
   }
   return out
 }
@@ -282,7 +286,7 @@ function outcomesByCallId(ctx: ResolveAuditContext): Map<string, CallOutcome> {
 function terminalOf(outcome: CallOutcome | undefined, callData: any, resultData: any): CallOutcome | null {
   const meta = resultData?.meta
   const fromCard = !!meta && typeof meta === 'object' && meta.card === 'terminal' && typeof meta.exitCode === 'number'
-    ? { exit: meta.exitCode as number, cmd: commandText(callData) } : null
+    ? { exit: meta.exitCode as number, cmd: commandText(callData), digest: '' } : null
   for (const s of [outcome ?? null, fromCard]) if (s && s.cmd.trim()) return s
   return null
 }
@@ -420,12 +424,16 @@ function buildEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDiges
     const determinate = status === 'passed' || status === 'failed'
     // Relevance + anti-masking gate: only an unmasked verification-class command speaks to acceptance.
     const verifiesAcceptance = !!t && isTrustworthyVerification(t.cmd, dialectOf(callData.name))
+    // The object version this proof may speak for: the one captured when the tool ran. A
+    // legacy `meta.card` result carries no such capture; it keeps the turn's digest and is
+    // therefore only as trustworthy as the host that emitted that shape (DSH emits none).
+    const proofDigest = t?.digest || objectDigest
     out.push({
       event_id: `verify:${c.result.event_id}`,
       task_id: c.result.task_id ?? task.task_id,
       objective_revision: c.result.objective_revision ?? task.objective_revision,
       requirement_ids: verifiesAcceptance && determinate ? applicableIds : [],
-      object_version_digest: objectDigest, environment_digest: envDigest,
+      object_version_digest: proofDigest, environment_digest: envDigest,
       status, complete: true, source_kind: 'host_verifier',
       verifier_ref: `dsh-tool:${toolName}:${c.tool_call_id}`,
       output_ref: c.result.output_ref ?? c.result.event_id,
@@ -594,6 +602,7 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
   if (!ids.length) return out
   const named = namedTargets(humanRequestText(ctx))
   const outcomes = outcomesByCallId(ctx)
+  const captured = digestsByCallId(ctx)
   for (const c of ctx.recovery.calls) {
     if (!hostOk(c)) continue
     const callData = dataOf(c.call), meta = dataOf(c.result).meta
@@ -614,7 +623,8 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
     out.push({
       event_id: `verify:${c.result.event_id}`, task_id: c.result.task_id ?? task.task_id,
       objective_revision: c.result.objective_revision ?? task.objective_revision,
-      requirement_ids: ids, object_version_digest: objectDigest, environment_digest: envDigest,
+      requirement_ids: ids, object_version_digest: captured.get(c.tool_call_id ?? '') || objectDigest,
+      environment_digest: envDigest,
       status: 'passed', complete: true, source_kind: 'host_verifier',
       verifier_ref: `dsh-host:docs-artifact:${written[0]}`, output_ref: c.result.output_ref ?? c.result.event_id,
       requires_exit_code: false, exit_code: null, assertion_passed: true,
@@ -630,9 +640,22 @@ function recordedDelivery(ctx: ResolveAuditContext): { ref: string; text: string
   return assistant && text.trim() ? { ref: assistant.event_id, text } : null
 }
 
-/** Host-observed queries to a source outside the workspace; local file reads do not count. */
-function externalSourceObserved(ctx: ResolveAuditContext): boolean {
-  return ctx.recovery.calls.some(c => hostOk(c) && EXTERNAL_SOURCE_TOOL.test(typeof dataOf(c.call).name === 'string' ? dataOf(c.call).name : ''))
+/**
+ * The most recent host-observed query to a source outside the workspace, together with the
+ * object version captured at that query and the revision it ran under. Returning the capture
+ * rather than a bare boolean is what lets a research proof speak for the moment it was made.
+ */
+function lastExternalQuery(ctx: ResolveAuditContext): { ref: string; digest: string; revision: number | null } | null {
+  const captured = digestsByCallId(ctx)
+  let found: { ref: string; digest: string; revision: number | null } | null = null
+  for (const c of ctx.recovery.calls) {
+    if (!hostOk(c)) continue
+    const name = dataOf(c.call).name
+    if (typeof name !== 'string' || !EXTERNAL_SOURCE_TOOL.test(name)) continue
+    found = { ref: c.result.event_id, digest: captured.get(c.tool_call_id ?? '') ?? '',
+      revision: c.result.objective_revision ?? null }
+  }
+  return found
 }
 
 /**
@@ -642,8 +665,8 @@ function externalSourceObserved(ctx: ResolveAuditContext): boolean {
  * anything, so it is dropped here and can neither verify nor contribute to the object
  * digest.
  */
-function opsOutcomes(ctx: ResolveAuditContext): Array<{ eventId: string; ref: string; cmd: string; exit: number }> {
-  const out: Array<{ eventId: string; ref: string; cmd: string; exit: number }> = []
+function opsOutcomes(ctx: ResolveAuditContext): Array<{ eventId: string; ref: string; cmd: string; exit: number; digest: string; revision: number | null }> {
+  const out: Array<{ eventId: string; ref: string; cmd: string; exit: number; digest: string; revision: number | null }> = []
   const outcomes = outcomesByCallId(ctx)
   for (const c of ctx.recovery.calls) {
     if (!hostOk(c)) continue
@@ -651,7 +674,8 @@ function opsOutcomes(ctx: ResolveAuditContext): Array<{ eventId: string; ref: st
     if (!t) continue
     const dialect = dialectOf(dataOf(c.call).name)
     if (hasMaskedExit(t.cmd, dialect) || !runsOpsEntry(t.cmd)) continue
-    out.push({ eventId: c.result.event_id, ref: c.result.output_ref ?? c.result.event_id, cmd: t.cmd, exit: t.exit })
+    out.push({ eventId: c.result.event_id, ref: c.result.output_ref ?? c.result.event_id, cmd: t.cmd, exit: t.exit,
+      digest: t.digest, revision: c.result.objective_revision ?? null })
   }
   return out
 }
@@ -664,15 +688,21 @@ function acceptanceIds(task: TaskContract): string[] {
  * research template: the delivered content is durably recorded by the host AND the
  * model consulted at least one source outside the workspace. Keyed on the recorded
  * delivery event. Without a recorded delivery or an external query, no proof (fail
- * closed) — a conclusion drawn from nothing but local files is not research.
+ * closed) — a conclusion drawn from nothing but local files is not research. The proof is
+ * attributed to the revision of the query it rests on, so a search from an earlier task
+ * revision cannot close a new one, and it attests the object version captured at that query.
  */
 function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
   const ids = acceptanceIds(task)
   const delivery = recordedDelivery(ctx)
-  if (!ids.length || !delivery || !externalSourceObserved(ctx) || !objectDigest) return []
+  const query = lastExternalQuery(ctx)
+  if (!ids.length || !delivery || !query) return []
+  const digest = query.digest || objectDigest
+  if (!digest) return []
   return [{
-    event_id: `verify:${delivery.ref}`, task_id: task.task_id, objective_revision: task.objective_revision,
-    requirement_ids: ids, object_version_digest: objectDigest, environment_digest: envDigest,
+    event_id: `verify:${delivery.ref}`, task_id: task.task_id,
+    objective_revision: query.revision ?? task.objective_revision,
+    requirement_ids: ids, object_version_digest: digest, environment_digest: envDigest,
     status: 'passed', complete: true, source_kind: 'host_verifier',
     verifier_ref: 'dsh-host:research-delivery', output_ref: delivery.ref,
     requires_exit_code: false, exit_code: null, assertion_passed: true,
@@ -680,22 +710,28 @@ function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, obj
 }
 
 /**
- * ops template: the actual entry point ran and the host observed a determinate,
- * unmasked exit 0. A masked (`|| true`, `;`, pipe), non-zero, or absent result is no
- * proof, and neither is a noop command (`echo`, `ls`, `cat`, ...) that exits 0
- * without operating on anything. Keyed on the terminal result event.
+ * ops template: the actual entry point ran and the host observed a determinate, unmasked
+ * exit 0. A masked (`|| true`, `;`, pipe), non-zero, or absent result is no proof, and
+ * neither is a noop command (`echo`, `ls`, `cat`, ...) that exits 0 without operating on
+ * anything. The LAST such attempt decides: an earlier success followed by a failure of the
+ * same entry point must not read as success (spec §107), so the newest outcome is used and a
+ * failing one simply yields no proof. The proof attests the object version captured at that
+ * attempt and the revision it ran under.
  */
 function buildOpsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
   const ids = acceptanceIds(task)
-  const ok = opsOutcomes(ctx).filter(o => o.exit === 0)
-  if (!ids.length || !ok.length || !objectDigest) return []
-  const o = ok[0]
+  const attempts = opsOutcomes(ctx)
+  const latest = attempts.at(-1)
+  if (!ids.length || !latest || latest.exit !== 0) return []
+  const digest = latest.digest || objectDigest
+  if (!digest) return []
   return [{
-    event_id: `verify:${o.eventId}`, task_id: task.task_id, objective_revision: task.objective_revision,
-    requirement_ids: ids, object_version_digest: objectDigest, environment_digest: envDigest,
+    event_id: `verify:${latest.eventId}`, task_id: task.task_id,
+    objective_revision: latest.revision ?? task.objective_revision,
+    requirement_ids: ids, object_version_digest: digest, environment_digest: envDigest,
     status: 'passed', complete: true, source_kind: 'host_verifier',
-    verifier_ref: `dsh-host:ops-entry:${o.cmd.slice(0, 80)}`, output_ref: o.ref,
-    requires_exit_code: false, exit_code: o.exit, assertion_passed: true,
+    verifier_ref: `dsh-host:ops-entry:${latest.cmd.slice(0, 80)}`, output_ref: latest.ref,
+    requires_exit_code: false, exit_code: latest.exit, assertion_passed: true,
   }]
 }
 

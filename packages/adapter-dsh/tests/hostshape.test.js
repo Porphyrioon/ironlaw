@@ -443,12 +443,12 @@ test('D2 dropping non-file paths does not make an empty object scope acceptable'
   assert.notEqual(decision(root).verdict, 'verified_complete', 'no file in scope means no valid object version')
 })
 
-// Proof records are re-minted every turn from the current working tree. Before this fix the
-// second turn re-recorded the same `verify:<result id>` with a different object digest, the
-// ledger threw evidence_event_id_conflict out of the turn-stopping hook, and the gate stopped
-// recording decisions for the rest of the session — the failure a live session reported as
-// "本轮运行失败 evidence_event_id_conflict".
-test('D3 a later turn with a moved object version does not collide on the proof id', t => {
+// A proof must attest the object version that existed WHEN THE TOOL RAN. Re-deriving the digest
+// at adjudication time instead re-bound an old passing run to whatever the tree had become
+// since — the invalidation the digest comparison exists to provide never fired. This test used
+// to assert the wrong outcome (`verified_complete` after the file changed without a re-run);
+// an independent review (F1) found that, and the assertion is now inverted.
+test('D3 a run is not carried over to a later object version, and does not collide', t => {
   const root = fixture(t), file = join(root, 'login.js')
   writeFileSync(file, 'b\n')
   const h = host(root)
@@ -458,16 +458,95 @@ test('D3 a later turn with a moved object version does not collide on the proof 
   assistant(h, '已修复并验证。', 6)
   h.stop(1)
   assert.equal(decision(root).verdict, 'verified_complete')
+  const before = proofs(root).map(p => ({ id: p.event_id, digest: p.object_version_digest }))
+  assert.equal(before.length, 1)
 
-  writeFileSync(file, 'c\n') // the object the earlier proof attested has moved on
-  assistant(h, '再次验证。', 7)
+  writeFileSync(file, 'throw new Error("regressed")\n') // the attested object has moved on
+  assistant(h, '我又改了实现。', 7)
   h.stop(2) // must not throw evidence_event_id_conflict
 
-  const stored = ledger(root).snapshot('session').filter(r => r.type === 'requirement.verification')
-  const ids = stored.map(r => r.event_id)
-  assert.equal(new Set(ids).size, ids.length, 'each object version gets its own proof record')
-  assert.ok(ids.length >= 2, `expected a second proof record, got ${ids.length}`)
+  const d = decision(root)
+  assert.equal(d.verdict, 'repair_required', 'a passing run cannot be re-bound to a later object')
+  assert.deepEqual(d.missing_requirements.map(m => m.missing_reason), ['evidence_stale'])
+  assert.deepEqual(proofs(root).map(p => ({ id: p.event_id, digest: p.object_version_digest })), before,
+    'the recorded proof keeps the version it was captured against')
+})
+
+// F1, second half: a re-run after the change must be able to pass again.
+test('D4 re-running the verification after the object moved verifies the new version', t => {
+  const root = fixture(t), file = join(root, 'login.js')
+  writeFileSync(file, 'b\n')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  edit(h, 'e1', file, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+
+  writeFileSync(file, 'c\n')
+  shell(h, 'v2', 'npm test', 0, 7, 8) // a fresh run against the new version
+  assistant(h, '重新验证过。', 9)
+  h.stop(2)
   assert.equal(decision(root).verdict, 'verified_complete')
+  assert.equal(proofs(root).length, 2, 'the new version gets its own proof')
+})
+
+// An independent review found the discussion exemption being persisted into the contract, where
+// it excused a later code task from evidence entirely (F2).
+test('F2 a discussion exemption does not survive into a later code task', t => {
+  const root = fixture(t)
+  const h = host(root)
+  user(h, '解释一下这个概念', 1)
+  assistant(h, '它是这样工作的。', 2)
+  h.stop(1)
+  assert.equal(decision(root).verdict, 'allow_response')
+
+  user(h, '修复登录的 bug 并验证', 3) // a new revision, code type, and no tools at all
+  assistant(h, '已修复。', 4)
+  h.stop(2)
+  const d = decision(root)
+  assert.equal(taskType(root), 'code')
+  assert.notEqual(d.verdict, 'verified_complete', 'a code task needs its own evidence')
+  assert.equal(d.evidence_refs.length, 0)
+  assert.ok(d.missing_requirements.length > 0)
+})
+
+// F5: an earlier success followed by a failure of the same entry point must not read as success.
+test('F5 a later failing deploy of the same entry point is not success', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '部署到生产环境')
+  shell(h, 'd1', './deploy.sh prod', 0, 2, 3)
+  shell(h, 'd2', './deploy.sh prod', 1, 4, 5)
+  assistant(h, '已部署。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete')
+})
+
+// F6: a verifier asked for its own help or version runs nothing, whatever it exits with.
+test('F6 `npm test --help` and `--version` do not verify', t => {
+  for (const command of ['npm test --help', 'npm test --version']) {
+    const root = fixture(t), file = join(root, 'login.js')
+    writeFileSync(file, 'b\n')
+    const h = host(root)
+    user(h, '修复登录的 bug 并验证')
+    edit(h, 'e1', file, 2, 3)
+    shell(h, 'v1', command, 0, 4, 5)
+    assistant(h, '已修复并验证。', 6)
+    h.stop(1)
+    assert.notEqual(decision(root).verdict, 'verified_complete', `${command} must not verify`)
+  }
+})
+
+// F7: printed text that looks like a redirect is data, not a document write.
+test('F7 a printed string that looks like a redirect is not a document write', t => {
+  const root = fixture(t), readme = join(root, 'README.md')
+  writeFileSync(readme, 'unchanged\n')
+  const h = host(root)
+  user(h, '更新 README 文档，补充安装说明')
+  shell(h, 'w1', `Write-Output '> ${readme}'`, 0, 2, 3)
+  assistant(h, 'README 已更新。', 4)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete')
 })
 
 // A derived record's id carries its content, so the same call reporting a different canonical
