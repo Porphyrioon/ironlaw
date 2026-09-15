@@ -105,3 +105,97 @@ test('legacy rows stay readable but never become v2 proof', t => {
   assert.deepEqual(ledger.verifications('s', 't1'), [])
   assert.equal(ledger.snapshot('s').length, 1)
 })
+
+// ⑥ recover() must re-read the durable bytes for that one session, not rebuild a whole
+// ledger: a per-turn full re-read is what made adjudication cost O(ledger size).
+test('recover reads only the requested session range, and matches a cold full read', t => {
+  const root = fixture(t), file = join(root, 'events.ndjson')
+  const seed = []
+  for (let i = 0; i < 5000; i++) seed.push(v2(i, `other-${i % 5}`))
+  writeFileSync(file, seed.join('\n') + '\n')
+  const fullSize = statSync(file).size
+  const ledger = new EvidenceLedger(root)
+  const a = ledger.record('mine', 'seed', { i: 'a' })
+  const b = ledger.record('mine', 'seed', { i: 'b' })
+
+  let bytes = 0
+  const orig = ledger.readTailBytes.bind(ledger)
+  ledger.readTailBytes = (f, pos, len) => { bytes += len; return orig(f, pos, len) }
+  const view = ledger.recover('mine')
+
+  assert.deepEqual(view.records.map(r => r.event_id), [a.event_id, b.event_id])
+  assert.equal(view.event_sequence, 2)
+  assert.ok(bytes > 0, 'recover must read something from disk (never proof from memory alone)')
+  assert.ok(bytes * 10 < fullSize, `recover read ${bytes}B of a ${fullSize}B ledger; it must not re-read the file`)
+
+  // Same answer as a cold instance that parsed the whole ledger.
+  const cold = new EvidenceLedger(root)
+  assert.deepEqual(view.records, cold.snapshot('mine'))
+  assert.deepEqual(cold.verifications('mine', 't1'), [])
+})
+
+// ⑦ A session whose records all arrived before this instance existed still recovers.
+test('recover returns a session that predates the instance', t => {
+  const root = fixture(t), file = join(root, 'events.ndjson')
+  const seed = []
+  for (let i = 0; i < 500; i++) seed.push(v2(i, 'old-session'))
+  seed.push(v2(501, 'other'))
+  writeFileSync(file, seed.join('\n') + '\n')
+  const view = new EvidenceLedger(root).recover('old-session')
+  assert.equal(view.records.length, 500)
+  assert.equal(view.event_sequence, 500)
+  assert.equal(view.records.map(r => r.event_id)[0], 'e0')
+})
+
+// ⑧ A corrupt line in the tail must leave the instance exactly as it was. readTail
+// ingested each good line as it parsed and only advanced its offset after the whole
+// chunk succeeded, so throwing on a corrupt line left the good prefix ingested with an
+// unmoved offset: the next call re-ingested that same prefix. recover() now calls
+// readTail on the long-lived instance once per turn, so one corrupt line duplicated the
+// tail into memory on every turn, forever.
+test('a corrupt tail line throws without duplicating the good prefix on retry', t => {
+  const root = fixture(t), file = join(root, 'events.ndjson')
+  writeFileSync(file, v2(1, 'mine') + '\n' + v2(2, 'mine') + '\n')
+  const ledger = new EvidenceLedger(root)
+  const before = ledger.snapshot('mine').length
+  assert.equal(before, 2)
+
+  // Another writer appends two good lines and then a corrupt one.
+  appendFileSync(file, v2(3, 'mine') + '\n' + v2(4, 'mine') + '\n' + '{"broken": ]\n')
+  let throws = 0
+  for (let i = 0; i < 5; i++) {
+    try { ledger.recover('mine') } catch (e) { assert.equal(e.message, 'evidence_ledger_corrupt'); throws++ }
+  }
+  assert.equal(throws, 5, 'a corrupt tail must keep failing closed')
+  assert.equal(ledger.snapshot('mine').length, before,
+    `good prefix re-ingested on every retry: ${before} -> ${ledger.snapshot('mine').length}`)
+
+  // Once the corrupt line is gone the tail folds in exactly once.
+  writeFileSync(file, readFileSync(file, 'utf8').replace('{"broken": ]\n', ''))
+  ledger.record('mine', 'seed', { i: 5 })
+  const ids = ledger.snapshot('mine').map(r => r.event_id)
+  assert.deepEqual(ids, ['e1', 'e2', 'e3', 'e4', ids.at(-1)], `unexpected ids ${JSON.stringify(ids)}`)
+  assert.equal(new Set(ids).size, ids.length, 'no record may appear twice')
+})
+
+// ⑨ recover() reads a byte range that was captured earlier, so it has to fold in what
+// another writer appended since. sessionBytes() calls readTail() for exactly this;
+// without it the range is stale and another process's records never reach adjudication.
+test('recover folds in records another instance appended after construction', t => {
+  const root = fixture(t)
+  writeFileSync(join(root, 'events.ndjson'), v2(1, 'mine') + '\n')
+  const A = new EvidenceLedger(root)
+  assert.equal(A.recover('mine').records.length, 1)
+
+  const B = new EvidenceLedger(root)
+  B.record('mine', 'from-b', { n: 2 })
+  B.record('mine', 'from-b', { n: 3 })
+  const view = A.recover('mine')
+  assert.equal(view.records.length, 3, 'A must see what B appended after A was constructed')
+  assert.equal(view.event_sequence, 3)
+  assert.deepEqual(view.records.map(r => r.payload).slice(1), [{ n: 2 }, { n: 3 }])
+
+  // A session A has never written to has no range at all until the tail is folded in.
+  B.record('brand-new', 'from-b', { n: 1 })
+  assert.equal(A.recover('brand-new').records.length, 1, 'a session A never wrote must still recover')
+})

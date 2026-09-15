@@ -1,12 +1,28 @@
-﻿import type { Context } from '@deepseek-ai/cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
-import { randomUUID } from 'node:crypto'
-import { EvidenceLedger, type EvidenceRecord } from './evidence.js'
+import { createHash, randomUUID } from 'node:crypto'
+import { EvidenceLedger, type Association, type EvidenceRecord } from './evidence.js'
 import { destructiveReason } from './policy.js'
 import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
 import { defaultResolveAudit } from './resolver.js'
+import { classifyTaskType } from './classify.js'
+
+/**
+ * An id for a record whose payload is re-derived from current state: the content is folded
+ * into the id, so re-deriving it later writes a NEW row instead of colliding with the old
+ * one. The ledger refuses to reuse an id for different content — an invariant worth keeping —
+ * but a derived record's content legitimately moves (a re-classification, a retried call),
+ * and the collision used to surface as a thrown error inside the turn-stopping hook, which
+ * killed the decision, the repair prompt and the gate itself for the rest of the session.
+ */
+function versionedId(base: string, payload: unknown, link: Association): string {
+  let body: string
+  try { body = JSON.stringify([payload, Object.entries(link).sort()]) ?? 'undefined' }
+  catch { body = `unserializable:${randomUUID()}` }
+  return `${base}:${createHash('sha256').update(body).digest('hex').slice(0, 12)}`
+}
 export const name = 'ironlaw'
 export const inject = ['tools', 'sessions', 'agents']
 export interface IronLawConfig {
@@ -24,9 +40,49 @@ function sessionIdOf(agent: { session?: { id?: unknown } } | undefined): string 
   const id = agent?.session?.id
   return typeof id === 'string' ? id : 'unknown'
 }
+/**
+ * Exit code from a canonical tool result value. DSH keeps that value execution-local
+ * and deliberately omits it from durable session events (`ToolExecutionSuccess.value`),
+ * and the real host's `payload.data.meta` is tool-structured output, never a UI card,
+ * so this hook is the only place the number can be captured. Without it no terminal
+ * evidence exists in a live session at all.
+ */
+function canonicalExitCode(value: unknown): number | null {
+  const exit = (value as { exitCode?: unknown } | null | undefined)?.exitCode
+  return typeof exit === 'number' && Number.isFinite(exit) ? exit : null
+}
+/** Command text from already-parsed hook arguments, which arrive as objects rather than JSON strings. */
+function canonicalCommand(args: unknown): string {
+  if (typeof args === 'string') return args
+  if (!args || typeof args !== 'object') return ''
+  for (const k of ['command', 'cmd', 'script', 'shell', 'code', 'commands', 'input']) {
+    const v = (args as Record<string, unknown>)[k]
+    if (typeof v === 'string') return v
+    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string').join(' && ')
+  }
+  return ''
+}
 export function apply(ctx: Context, config: IronLawConfig = {}): void {
   const mode = config.mode ?? (process.env.IRONLAW_MODE === 'enforcer' ? 'enforcer' : 'observe')
   const ledger = new EvidenceLedger(config.evidenceRoot)
+/**
+ * Write a record whose content is re-derived from current state. A collision on such a
+ * record is a data anomaly, not a reason to lose the turn: the gate's whole job is the
+ * decision at the end of this hook, so the anomaly is recorded as its own diagnostic row
+ * and the turn continues. Core transaction records (contract, state, decision) are written
+ * with `ledger.record` directly and still fail loud, because those failing means the ledger
+ * itself is inconsistent and a silent pass would be worse.
+ */
+  const recordDerived = (sessionId: string, type: string, payload: unknown, link: Association): void => {
+    try { ledger.record(sessionId, type, payload, link) }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!message.includes('evidence_event_id_conflict')) throw error
+      ledger.record(sessionId, 'policy.conflict',
+        { type, attempted_event_id: link.event_id ?? null, message },
+        { event_id: `dsh:${sessionId}:conflict:${randomUUID()}`, task_id: link.task_id ?? null })
+    }
+  }
   const responses = new Map<string, { text: string; seq: number }>()
   const taskFor = (sessionId: string): TaskContract => ledger.task(sessionId) ?? {
     schema_version: 2, task_id: `unresolved:${sessionId}`, objective_revision: 1,
@@ -44,12 +100,24 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     return reason
   })
   ctx.on('tools/result', (exec, result) => {
-    ledger.record(sessionIdOf(exec.agent), 'tool.execute.after', { name: exec.name, isError: result.isError })
+    const sessionId = sessionIdOf(exec.agent)
+    ledger.record(sessionId, 'tool.execute.after', { name: exec.name, isError: result.isError })
+    // Persist the canonical outcome under its own record type, keyed by call id. The
+    // tool.call/tool.result pairing written by the session event stream is left
+    // untouched; this only adds the exit code that stream never carries.
+    const exitCode = canonicalExitCode(result.isError ? undefined : result.value)
+    const command = canonicalCommand(exec.arguments)
+    const callId = typeof exec.callId === 'string' ? exec.callId : ''
+    if (!callId || (exitCode === null && !command)) return
+    const outcome = { tool_call_id: callId, name: exec.name, command, exit_code: exitCode, is_error: result.isError }
+    const outcomeLink = { tool_call_id: callId, exit_code: exitCode }
+    recordDerived(sessionId, 'tool.outcome', outcome,
+      { ...outcomeLink, event_id: versionedId(`dsh:${sessionId}:outcome:${callId}`, outcome, outcomeLink) })
   })
   ctx.on('session/event', (session, event) => {
     if (event.type === 'assistant/chunk') return
     const eventId = `dsh:${session.id}:${event.seq}`
-    if (ledger.snapshot(session.id).some(r => r.event_id === eventId)) return
+    if (ledger.hasEvent(session.id, eventId)) return
     const data = event.data as any
     let task = taskFor(session.id)
     // Only actual human messages revise the contract. Synthetic feedback retains provenance.
@@ -60,6 +128,14 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
       ledger.record(session.id, 'task.contract', task, { task_id: task.task_id, objective_revision: task.objective_revision })
       ledger.record(session.id, 'task.revision', { event_id: eventId, task_id: task.task_id, kind: 'user_revision',
         requirement_ids: task.requirements.map(r => r.requirement_id), source_ref: eventId, observed: true }, { task_id: task.task_id })
+      // Host-side classification from the human request only; persisted per revision so
+      // the type is stable across turns and never re-derived from model output.
+      const humanText = (Array.isArray(data.content) ? data.content : [])
+        .filter((p: any) => p?.type === 'text').map((p: any) => p.text).join('\n')
+      const classification = { task_type: classifyTaskType(humanText), source_ref: eventId, observed: true }
+      const classificationLink = { task_id: task.task_id, objective_revision: task.objective_revision }
+      recordDerived(session.id, 'task.classification', classification,
+        { ...classificationLink, event_id: versionedId(`${eventId}:classification`, classification, classificationLink) })
     }
     if (event.type === 'assistant/message') responses.set(session.id, {
       text: (data.message?.content ?? []).filter((p: any) => p.type === 'text').map((p: any) => p.text).join('\n'), seq: event.seq,
@@ -100,7 +176,7 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     const replayed = previous && Object.hasOwn(previous.replay, input.request_id)
     const { decision, state } = auditTurn({ ...input, previous })
     ledger.record(sessionId, 'task.contract', { ...input.task, status: state.task_status }, { task_id: input.task.task_id, objective_revision: input.task.objective_revision })
-    for (const proof of input.evidence) ledger.record(sessionId, 'requirement.verification', proof, {
+    for (const proof of input.evidence) recordDerived(sessionId, 'requirement.verification', proof, {
       event_id: proof.event_id, task_id: proof.task_id, objective_revision: proof.objective_revision,
       requirement_ids: proof.requirement_ids, tool_call_id: proof.tool_call_id ?? null,
       source_kind: proof.source_kind, result_status: proof.status, output_ref: proof.output_ref,
@@ -121,6 +197,8 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
 // Public protocol types and host-side fingerprint utility.
 export type { TaskContract, Requirement, Candidate, Verification, Decision, AuditState, AuditInput, RecoveryEvent, HardConstraintCheck, Verdict } from './audit.js'
 export { objectVersionDigest } from './fingerprint.js'
+export { classifyTaskType, isTaskType, TASK_TYPES } from './classify.js'
+export type { TaskType } from './classify.js'
 export { defaultResolveAudit } from './resolver.js'
 export type { ResolveAuditContext } from './resolver.js'
 export { EvidenceLedger } from './evidence.js'

@@ -1,4 +1,4 @@
-﻿import { appendFileSync, mkdirSync, readFileSync, existsSync, statSync, openSync, readSync, closeSync, unlinkSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, existsSync, statSync, openSync, readSync, closeSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -18,12 +18,45 @@ function safeJson(value: unknown): unknown {
   try { return JSON.parse(JSON.stringify(sanitizeEvidence(value))) }
   catch { return { __unserializable__: true } }
 }
+/** Latest v2 record of a type among already-parsed records, payload cloned off the ledger. */
+function latestIn<T>(records: EvidenceRecord[], type: string, taskId?: string): T | undefined {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const r = records[i]
+    if (r.schema_version === 2 && r.type === type && (!taskId || r.task_id === taskId)) return structuredClone(r.payload) as T
+  }
+  return undefined
+}
+/** Call/result pairing uses durable IDs. A call alone or result alone is unknown. */
+function callsIn(records: EvidenceRecord[]): Array<{ tool_call_id: string; status: Status; call?: EvidenceRecord; result?: EvidenceRecord }> {
+  const groups = new Map<string, { tool_call_id: string; status: Status; call?: EvidenceRecord; result?: EvidenceRecord }>()
+  for (const r of records) {
+    if (!r.tool_call_id || !['tool.call', 'tool.result'].includes(r.type)) continue
+    if (r.schema_version !== 2) continue
+    const key = JSON.stringify([r.task_id, r.objective_revision, r.tool_call_id])
+    const item = groups.get(key) ?? { tool_call_id: r.tool_call_id, status: 'unknown' as Status }
+    if (r.type === 'tool.call') item.call = r
+    else item.result = r
+    item.status = item.call && item.result ? item.result.result_status : 'unknown'
+    groups.set(key, item)
+  }
+  return [...groups.values()]
+}
+function verificationsIn(records: EvidenceRecord[], taskId: string): Verification[] {
+  return records.filter(r => r.schema_version === 2 && r.task_id === taskId
+    && r.type === 'requirement.verification').map(r => r.payload as Verification)
+}
 /** Append-only records; legacy rows remain readable but never become v2 proof. */
 export class EvidenceLedger {
   readonly root: string
   private records: EvidenceRecord[] = []
   /** event_id -> first record with that id; makes idempotency/conflict checks O(1). */
   private index = new Map<string, EvidenceRecord>()
+  /** session_id -> its records in append order, so every per-session query is O(session)
+   * instead of O(ledger). The ledger grows forever; the queries must not. */
+  private bySession = new Map<string, EvidenceRecord[]>()
+  /** session_id -> [start, end) byte range of its lines on disk. Lets `recover` re-read the
+   * durable bytes that belong to one session instead of constructing a whole second ledger. */
+  private ranges = new Map<string, { start: number; end: number }>()
   /** Byte offset of events.ndjson already loaded into memory; appends read only past it. */
   private offset = 0
   constructor(root?: string) {
@@ -35,18 +68,29 @@ export class EvidenceLedger {
       this.offset = buf.byteLength
       const raw = buf.toString('utf8')
       const lines = raw.split('\n')
+      let lineStart = 0
       for (let i = 0; i < lines.length; i++) {
-        if (!lines[i].trim()) continue
-        try { this.ingest(JSON.parse(lines[i])) }
-        catch { throw new Error('evidence_ledger_corrupt') }
+        const text = lines[i], width = Buffer.byteLength(text, 'utf8') + 1
+        if (text.trim()) {
+          try { this.ingest(JSON.parse(text), lineStart, lineStart + width) }
+          catch { throw new Error('evidence_ledger_corrupt') }
+        }
+        lineStart += width
       }
       if (raw && !raw.endsWith('\n')) { appendFileSync(file, '\n'); this.offset += 1 }
     }
   }
-  private ingest(record: EvidenceRecord): void {
+  private ingest(record: EvidenceRecord, byteStart?: number, byteEnd?: number): void {
     this.records.push(record)
     const id = record && typeof record === 'object' ? record.event_id : undefined
     if (typeof id === 'string' && !this.index.has(id)) this.index.set(id, record)
+    const sessionId = record && typeof record === 'object' ? record.session_id : undefined
+    if (typeof sessionId !== 'string') return
+    const list = this.bySession.get(sessionId)
+    if (list) list.push(record); else this.bySession.set(sessionId, [record])
+    if (byteStart === undefined || byteEnd === undefined) return
+    const range = this.ranges.get(sessionId)
+    if (range) range.end = byteEnd; else this.ranges.set(sessionId, { start: byteStart, end: byteEnd })
   }
   record(sessionId: string, type: string, payload: unknown, link: Association = {}): EvidenceRecord {
     return this.withLock(() => {
@@ -64,11 +108,22 @@ export class EvidenceLedger {
     const lastNewline = chunk.lastIndexOf('\n')
     if (lastNewline === -1) return
     const complete = chunk.slice(0, lastNewline)
+    // All-or-nothing: parse the whole tail before ingesting any of it, and advance the
+    // offset only after every line is in. Ingesting line by line meant a corrupt line
+    // threw with the good prefix already folded in and the offset unmoved, so the next
+    // call re-ingested that same prefix. recover() calls this once per turn, so one
+    // corrupt line would duplicate the tail into memory on every turn.
+    const pending: Array<{ record: EvidenceRecord; start: number; end: number }> = []
+    let lineStart = this.offset
     for (const line of complete.split('\n')) {
-      if (!line.trim()) continue
-      try { this.ingest(JSON.parse(line)) }
-      catch { throw new Error('evidence_ledger_corrupt') }
+      const width = Buffer.byteLength(line, 'utf8') + 1
+      if (line.trim()) {
+        try { pending.push({ record: JSON.parse(line), start: lineStart, end: lineStart + width }) }
+        catch { throw new Error('evidence_ledger_corrupt') }
+      }
+      lineStart += width
     }
+    for (const p of pending) this.ingest(p.record, p.start, p.end)
     this.offset += Buffer.byteLength(complete, 'utf8') + 1
   }
   /** Seam for tests to count bytes read; reads only [position, position+length). */
@@ -109,46 +164,66 @@ export class EvidenceLedger {
       ...link, type, payload: safeJson(payload), occurred_at: new Date().toISOString(),
     }
     const line = `${JSON.stringify(record)}\n`
+    const width = Buffer.byteLength(line, 'utf8'), byteStart = this.offset
     appendFileSync(join(this.root, 'events.ndjson'), line)
-    this.ingest(record)
-    this.offset += Buffer.byteLength(line, 'utf8')
+    this.ingest(record, byteStart, byteStart + width)
+    this.offset += width
     return record
   }
-  snapshot(sessionId: string): EvidenceRecord[] { return structuredClone(this.records.filter(r => r.session_id === sessionId)) }
+  /** True when this exact event id is already durably recorded for this session (O(1)). */
+  hasEvent(sessionId: string, eventId: string): boolean {
+    const r = this.index.get(eventId)
+    return !!r && r.session_id === sessionId
+  }
+  snapshot(sessionId: string): EvidenceRecord[] { return structuredClone(this.bySession.get(sessionId) ?? []) }
   latest<T>(sessionId: string, type: string, taskId?: string): T | undefined {
-    const r = this.records.filter(r => r.schema_version === 2 && r.session_id === sessionId
-      && r.type === type && (!taskId || r.task_id === taskId)).at(-1)
-    return r ? structuredClone(r.payload) as T : undefined
+    return latestIn<T>(this.bySession.get(sessionId) ?? [], type, taskId)
   }
   task(sessionId: string): TaskContract | undefined { return this.latest(sessionId, 'task.contract') }
   auditState(sessionId: string, taskId: string): AuditState | undefined { return this.latest(sessionId, 'completion.state', taskId) }
-  /** Call/result pairing uses durable IDs. A call alone or result alone is unknown. */
   calls(sessionId: string): Array<{ tool_call_id: string; status: Status; call?: EvidenceRecord; result?: EvidenceRecord }> {
-    const groups = new Map<string, { tool_call_id: string; status: Status; call?: EvidenceRecord; result?: EvidenceRecord }>()
-    for (const r of this.snapshot(sessionId)) {
-      if (!r.tool_call_id || !['tool.call', 'tool.result'].includes(r.type)) continue
-      if (r.schema_version !== 2) continue
-      const key = JSON.stringify([r.task_id, r.objective_revision, r.tool_call_id])
-      const item = groups.get(key) ?? { tool_call_id: r.tool_call_id, status: 'unknown' as Status }
-      if (r.type === 'tool.call') item.call = r
-      else item.result = r
-      item.status = item.call && item.result ? item.result.result_status : 'unknown'
-      groups.set(key, item)
-    }
-    return [...groups.values()]
+    return callsIn(this.snapshot(sessionId))
   }
   verifications(sessionId: string, taskId: string): Verification[] {
-    return this.snapshot(sessionId).filter(r => r.schema_version === 2 && r.task_id === taskId
-      && r.type === 'requirement.verification').map(r => r.payload as Verification)
+    return verificationsIn(this.snapshot(sessionId), taskId)
   }
-  /** Re-open the durable log, never reconstruct authority or proof from a summary. */
+  /** The durable bytes holding this session's lines, or null when there are none. */
+  private sessionBytes(sessionId: string): Buffer | null {
+    const file = join(this.root, 'events.ndjson')
+    if (!existsSync(file)) return null
+    this.readTail() // fold in bytes another writer appended, so the range is current
+    const size = statSync(file).size
+    if (size === 0) return null
+    const range = this.ranges.get(sessionId)
+    if (!range) return this.readTailBytes(file, 0, size)
+    const start = Math.max(0, Math.min(range.start, size))
+    const end = Math.max(start, Math.min(range.end, size))
+    return this.readTailBytes(file, start, end - start)
+  }
+  /**
+   * Re-open the durable log for one session, never reconstruct authority or proof from a
+   * summary. The bytes are re-read from disk, so a tampered or in-memory-only value cannot
+   * become proof — but only the range that holds this session's lines is read, instead of
+   * building a second whole ledger and re-parsing every session on every turn.
+   */
   recover(sessionId: string) {
-    const durable = new EvidenceLedger(this.root)
-    const records = durable.snapshot(sessionId)
-    const task = durable.task(sessionId)
+    const buf = this.sessionBytes(sessionId)
+    const records: EvidenceRecord[] = []
+    if (buf) {
+      const raw = buf.toString('utf8'), lastNewline = raw.lastIndexOf('\n')
+      const complete = lastNewline === -1 ? raw : raw.slice(0, lastNewline)
+      for (const line of complete.split('\n')) {
+        if (!line.trim()) continue
+        let parsed: unknown
+        try { parsed = JSON.parse(line) } catch { throw new Error('evidence_ledger_corrupt') }
+        const r = parsed as EvidenceRecord
+        if (r && typeof r === 'object' && r.session_id === sessionId) records.push(r)
+      }
+    }
+    const task = latestIn<TaskContract>(records, 'task.contract')
     return { records, event_sequence: records.length, task,
-      audit: task ? durable.auditState(sessionId, task.task_id) : undefined,
-      evidence: task ? durable.verifications(sessionId, task.task_id) : [],
-      calls: durable.calls(sessionId) }
+      audit: task ? latestIn<AuditState>(records, 'completion.state', task.task_id) : undefined,
+      evidence: task ? verificationsIn(records, task.task_id) : [],
+      calls: callsIn(records) }
   }
 }

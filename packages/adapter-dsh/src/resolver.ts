@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import type { EvidenceLedger, EvidenceRecord } from './evidence.js'
 import { objectVersionDigest } from './fingerprint.js'
+import { classifyTaskType, isTaskType, hostReadable, type TaskType } from './classify.js'
 import type { AuditInput, Candidate, HardConstraintCheck, Status, TaskContract, Verification } from './audit.js'
 
 /**
@@ -40,10 +40,23 @@ function modelSourced(r: EvidenceRecord | undefined): boolean {
   return r?.source_kind === 'model' || r?.source_kind === 'summary'
 }
 
+/** Lowercase basename: no directory part, no trailing separator, POSIX or Win32. */
+function baseName(path: string): string {
+  const s = path.replace(/\\/g, '/').trim().replace(/\/+$/, '')
+  const i = s.lastIndexOf('/')
+  return (i >= 0 ? s.slice(i + 1) : s).toLowerCase()
+}
+/** A basename with its extension removed, so `README` and `README.md` compare equal. */
+const stemOf = (base: string): string => base.replace(/\.[^.]+$/, '')
+/** Forward slashes and lowercase, the form every path comparison here uses. */
+const slashOf = (path: string): string => path.replace(/\\/g, '/').toLowerCase()
+
 /**
- * Affected file paths: DSH diff metas (mutations report `card:'diff'` with
- * `diffs[].path`) plus write/edit call arguments. Reads/searches carry no
- * mutation path, so they do not enter the object scope.
+ * Affected paths: DSH diff metas (mutations report `card:'diff'` with `diffs[].path`),
+ * `meta.locations`, plus the path-like arguments of any tool call. Reads and searches are
+ * collected too — the arguments are not filtered by tool name — so the list may contain
+ * directories and paths that are not artifacts. Only host-readable *regular files* are
+ * allowed to enter the object scope below; anything else would throw while hashing.
  */
 function affectedPaths(records: EvidenceRecord[]): string[] {
   const paths = new Set<string>()
@@ -66,9 +79,14 @@ function affectedPaths(records: EvidenceRecord[]): string[] {
   return [...paths]
 }
 
-/** Real digest over affected, readable files (includes uncommitted bytes); conservative empty when scope is unknown. */
+/**
+ * Real digest over the affected host-readable files (includes uncommitted bytes). An empty
+ * scope — or one where no path is an openable regular file — reports empty rather than
+ * guessing; a directory or unreadable path is dropped per-path instead of collapsing the
+ * whole digest, which previously turned every acceptance item into `evidence_stale`.
+ */
 function computeObjectDigest(records: EvidenceRecord[]): string {
-  const paths = affectedPaths(records).filter(p => { try { return existsSync(p) } catch { return false } })
+  const paths = affectedPaths(records).filter(hostReadable)
   if (!paths.length) return ''
   try { return objectVersionDigest(paths) } catch { return '' }
 }
@@ -104,14 +122,38 @@ function commandText(callData: any): string {
 
 /** Shell control operators, longest-first so `&&`/`||` are not split into `&`/`|`. */
 const SHELL_OPS = /&&|\|\||[;|\n]/g
+/** Shell dialect, decided by the tool that ran the command. */
+type ShellDialect = 'posix' | 'powershell'
+/** PowerShell tool names; every other name is read as POSIX. */
+const POWERSHELL_TOOL = /^(?:pwsh|powershell)$/i
 /**
- * Connectors after which the preceding segment's exit code can be eaten by a
- * later segment, so the host's aggregate exit no longer reflects the verifier:
- * `||` (successor runs on failure and its exit wins), `;` and newline (successor
- * always runs and its exit wins), `|` (pipeline exit is the last element's).
- * `&&` is deliberately absent: a failure short-circuits and propagates.
+ * Dialect of the paired tool call. Unrecognized and missing names fall back to POSIX,
+ * whose masking set is the larger one, so an unknown shell never gets the looser
+ * PowerShell reading.
  */
-const MASKING_CONN = new Set(['||', ';', '|', '\n'])
+function dialectOf(toolName: unknown): ShellDialect {
+  return typeof toolName === 'string' && POWERSHELL_TOOL.test(toolName.trim()) ? 'powershell' : 'posix'
+}
+/**
+ * Connectors after which a later segment's exit code wins, so the aggregate exit the
+ * host reports no longer reflects the verifier: `||` (successor runs on failure and
+ * its exit wins), `;` and newline (successor always runs and its exit wins).
+ *
+ * The dialects differ exactly on `|`. A POSIX pipeline exits with its last element, so
+ * `|` masks. PowerShell pipes objects between commands and the host records the
+ * subprocess exit code, which a pipe to a cmdlet leaves intact; measured on Windows
+ * PowerShell 5.1, `cmd /c exit 3 | Select-Object -Last 1` and `cmd /c exit 3 | cat`
+ * both still report the failure, while `cmd /c exit 3; Write-Host hi` reports success
+ * (`;` masks there even when the successor is only a cmdlet). So `|` is masking for
+ * POSIX only, and `;` masks in both.
+ *
+ * `&&` is absent from both: a failure short-circuits and propagates. `2>&1` is a
+ * redirection, not a connector, and SHELL_OPS never splits on it.
+ */
+const MASKING_CONN: Record<ShellDialect, ReadonlySet<string>> = {
+  posix: new Set(['||', ';', '|', '\n']),
+  powershell: new Set([';', '||', '\n']),
+}
 /** Split a command line into segments and the connector that joins each pair. */
 function splitShellSegments(cmd: string): { segs: string[]; conns: string[] } {
   const segs: string[] = [], conns: string[] = []
@@ -149,39 +191,180 @@ const VERIFIER_PATTERNS: RegExp[] = [
 
 /**
  * True only when the command reliably runs a verification tool AND that tool's
- * exit code reaches the host's aggregate exit unmasked. Splits on shell operators
- * and matches each segment's leading verb, so irrelevant commands (echo/ls/cat/
- * reads/prints) and unparseable commands return false (fail closed). A verifier
- * followed by `||`/`;`/`|` (or preceded by `||`) can yield aggregate exit 0
- * despite a real failure, so it also returns false. `&&` neighbours are kept:
- * a failure short-circuits and propagates to the aggregate exit.
+ * exit code reaches the host's aggregate exit unmasked under the shell's own dialect.
+ * Splits on shell operators and matches each segment's leading verb, so irrelevant
+ * commands (echo/ls/cat/reads/prints) and unparseable commands return false (fail
+ * closed). A verifier followed by a connector that masks in this dialect (or preceded
+ * by `||`) can yield aggregate exit 0 despite a real failure, so it also returns
+ * false. `&&` neighbours are kept: a failure short-circuits and propagates.
  */
-function isTrustworthyVerification(cmd: string): boolean {
+function isTrustworthyVerification(cmd: string, dialect: ShellDialect): boolean {
   if (!cmd || !cmd.trim()) return false
+  const masking = MASKING_CONN[dialect]
   const { segs, conns } = splitShellSegments(cmd)
   const norm = segs.map(s => s.trim().replace(LEAD_STRIP, '').trim())
   const verifiers = norm.map((s, i) => (s && VERIFIER_PATTERNS.some(re => re.test(s)) ? i : -1)).filter(i => i >= 0)
   if (!verifiers.length) return false
   return verifiers.every(v => {
-    for (let i = v; i < conns.length; i++) if (MASKING_CONN.has(conns[i])) return false
+    for (let i = v; i < conns.length; i++) if (masking.has(conns[i])) return false
     return !(v > 0 && conns[v - 1] === '||')
   })
+}
+
+/** True when any connector could eat a failure in this dialect, so the aggregate exit no longer reflects the operation. */
+function hasMaskedExit(cmd: string, dialect: ShellDialect): boolean {
+  if (!cmd || !cmd.trim()) return false
+  const masking = MASKING_CONN[dialect]
+  return splitShellSegments(cmd).conns.some(c => masking.has(c))
+}
+
+/** One durable canonical outcome recorded by the host's `tools/result` hook. */
+interface CallOutcome { exit: number; cmd: string }
+
+/**
+ * Canonical outcomes by call id. A real DSH session puts the exit code only in the
+ * execution-local result value, which never reaches the session event stream, so the
+ * host hook persists it as a `tool.outcome` record. Entries without a numeric exit
+ * code are dropped: an absent number is unknown, never a pass.
+ */
+function outcomesByCallId(ctx: ResolveAuditContext): Map<string, CallOutcome> {
+  const out = new Map<string, CallOutcome>()
+  for (const r of ctx.records) {
+    if (r.type !== 'tool.outcome') continue
+    const id = r.tool_call_id
+    if (typeof id !== 'string' || !id) continue
+    const exit = typeof r.exit_code === 'number' && Number.isFinite(r.exit_code) ? r.exit_code
+      : typeof (r.payload as any)?.exit_code === 'number' ? (r.payload as any).exit_code : null
+    if (exit === null) continue
+    const cmd = (r.payload as any)?.command
+    out.set(id, { exit, cmd: typeof cmd === 'string' ? cmd : '' })
+  }
+  return out
+}
+
+/**
+ * Terminal evidence for one call: the durable canonical outcome is primary, the
+ * `meta.card:'terminal'` UI shape some hosts emit is the fallback. Returns null when
+ * neither carries both a numeric exit code and command text, so an unclassifiable
+ * invocation stays `unknown` instead of minting an uncheckable pass.
+ */
+function terminalOf(outcome: CallOutcome | undefined, callData: any, resultData: any): CallOutcome | null {
+  const meta = resultData?.meta
+  const fromCard = !!meta && typeof meta === 'object' && meta.card === 'terminal' && typeof meta.exitCode === 'number'
+    ? { exit: meta.exitCode as number, cmd: commandText(callData) } : null
+  for (const s of [outcome ?? null, fromCard]) if (s && s.cmd.trim()) return s
+  return null
+}
+
+/**
+ * Shells and runtimes that accept inline code (`-c`/`-e`), so an invocation of one
+ * is an entry point only when it is given a script file to run.
+ */
+const INTERPRETER = new Set(['sh', 'bash', 'zsh', 'ksh', 'dash', 'fish', 'csh', 'tcsh', 'python', 'python2',
+  'python3', 'node', 'nodejs', 'deno', 'bun', 'ts-node', 'perl', 'ruby', 'php', 'powershell', 'pwsh', 'cmd'])
+/** A script-file argument: the only thing that turns an interpreter call into an entry point. */
+const SCRIPT_ARG = /[^\s\\/]+\.(?:sh|bash|zsh|ksh|py|rb|pl|js|mjs|cjs|ts|ps1|bat|cmd)(?:\s|$)/
+/**
+ * Commands that ship nothing by themselves — they print, inspect, or move the shell.
+ * Their exit 0 reports only that they ran, so they are never an operation entry point
+ * (spec §12 A05: an irrelevant exit-0 command satisfies no acceptance requirement).
+ */
+const OPS_NOOP = new Set(['echo', 'printf', 'true', 'false', 'yes', 'test', ':', '.', 'cd', 'pushd', 'popd', 'pwd',
+  'ls', 'dir', 'cat', 'tac', 'bat', 'head', 'tail', 'less', 'more', 'wc', 'stat', 'file', 'type', 'which', 'whereis',
+  'command', 'whoami', 'id', 'hostname', 'uname', 'arch', 'date', 'uptime', 'env', 'printenv', 'set', 'export',
+  'unset', 'alias', 'history', 'jobs', 'ps', 'top', 'htop', 'free', 'df', 'du', 'sort', 'uniq', 'cut', 'tr', 'tee',
+  'xargs', 'seq', 'man', 'help', 'info', 'tree', 'find', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'awk', 'sed', 'diff',
+  'cmp', 'md5sum', 'sha1sum', 'sha256sum', 'basename', 'dirname', 'realpath', 'readlink', 'mktemp', 'touch', 'sleep',
+  'wait', 'read'])
+/**
+ * Operation entry points, anchored at a segment's program verb after directory
+ * stripping. Every verb here changes state somewhere — it ships, publishes, applies,
+ * transfers or restarts. Read-only and build-only verbs (`terraform plan`,
+ * `docker build`, `pulumi preview`, `helm template`, `mvn release:prepare`) are
+ * deliberately absent: they exit 0 having changed nothing, so they cannot complete a
+ * request to deploy. Same discipline as VERIFIER_PATTERNS — an unlisted or ambiguous
+ * verb fails closed.
+ */
+const OPS_ENTRY_PATTERNS: RegExp[] = [
+  /^[^\s\\/]+\.(?:sh|bash|zsh|ksh|py|rb|pl|js|mjs|cjs|ts|ps1|bat|cmd|exe)(?:\s|$)/,
+  /^(?:deploy|redeploy|release|publish|ship|rollout)\b/,
+  /^(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?(?:deploy|release|publish|ship|rollout)(?:[\s:]|$)/,
+  /^make\s+(?:deploy|release|publish|ship|rollout|install|serve|up)(?:\s|$)/,
+  /^(?:gradle|gradlew)\s+(?:deploy|release|publish)(?:\s|$)/,
+  /^mvn\s+(?:deploy|release:perform)(?:\s|$)/,
+  /^(?:dotnet|cargo|twine|gem|composer|nuget)\s+(?:publish|upload|release|push)(?:\s|$)/,
+  /^(?:docker|podman)\s+(?:compose\s+)?(?:push|run|up|start|deploy|restart)(?:\s|$)/,
+  /^(?:docker-compose|podman-compose)\s+(?:up|push|restart|start)(?:\s|$)/,
+  /^kubectl\s+(?:apply|rollout|scale|set|create|replace|patch|delete)(?:\s|$)/,
+  /^helm\s+(?:install|upgrade|rollback|uninstall)(?:\s|$)/,
+  /^(?:terraform|tofu)\s+(?:apply|destroy)(?:\s|$)/,
+  /^(?:pulumi|cdk|serverless|sls|sam|sst)\s+(?:up|deploy|destroy)(?:\s|$)/,
+  /^ansible(?:-playbook)?\b/,
+  /^(?:systemctl|service)\s+(?:start|stop|restart|reload|enable|disable)\s+\S/,
+  /^(?:pm2|supervisorctl|forever)\s+(?:start|restart|reload|stop|delete|resurrect)\b/,
+  /^(?:scp|rsync|sftp|ssh)\s+\S/,
+  /^git\s+push(?:\s|$)/,
+  /^(?:aws|gcloud|az|oci|doctl|fly|flyctl|vercel|netlify|wrangler|heroku|railway|render|surge|amplify)(?:\s+[\w.@:/-]+){0,3}\s+[\w.-]*(?:deploy|release|publish|sync|upload|rollout|apply|push)\b/,
+]
+/**
+ * Program and script names that only build, inspect or dry-run. Running one exits 0
+ * without changing any deployed state, so it is not an operation entry point even
+ * though it is a real script (`./build.sh`, `bash scripts/test.sh`).
+ */
+const OPS_BUILD_ONLY = new Set(['build', 'rebuild', 'compile', 'package', 'pack', 'bundle', 'plan', 'preview',
+  'diff', 'test', 'tests', 'check', 'lint', 'validate', 'verify', 'fmt', 'format', 'clean', 'dryrun', 'dry-run'])
+/**
+ * Flags that turn a real entry point into a rehearsal, so nothing changes state.
+ * Long forms only: short flags are ambiguous (`-n` is rsync's dry run but kubectl's
+ * namespace), and a false negative here blocks a genuine deploy.
+ */
+const DRY_RUN_FLAG = /(?:^|\s)--(?:dry-?run|check|preview|noop|no-op)(?:[=\s]|$)/
+
+/** True when one shell segment invokes a real, state-changing operation entry point. */
+function opsEntrySegment(seg: string): boolean {
+  const s = seg.trim().replace(LEAD_STRIP, '').trim()
+  if (!s || DRY_RUN_FLAG.test(s)) return false
+  const parts = s.split(/\s+/)
+  const base = baseName(parts[0]), verb = stemOf(base)
+  if (!verb || OPS_NOOP.has(verb) || OPS_BUILD_ONLY.has(verb)) return false
+  const rest = [base, ...parts.slice(1)].join(' ')
+  if (INTERPRETER.has(verb)) {
+    // An interpreter counts only for the script it runs, and that script must not be
+    // a build/test either.
+    const script = rest.match(SCRIPT_ARG)?.[0].trim()
+    return !!script && !OPS_BUILD_ONLY.has(stemOf(baseName(script)))
+  }
+  return OPS_ENTRY_PATTERNS.some(re => re.test(rest))
+}
+
+/**
+ * True when the command actually invokes an operation entry point. Masking is gated
+ * by the caller (`opsOutcomes` drops any command with a masking connector), so this
+ * answers only "is a real operation here": a noop exiting 0 is not one.
+ */
+function runsOpsEntry(cmd: string): boolean {
+  if (!cmd || !cmd.trim()) return false
+  return splitShellSegments(cmd).segs.some(opsEntrySegment)
 }
 
 /**
  * One `host_verifier` proof per complete call/result pair from the ledger.
  * - A half pair (call or result alone) is skipped: it stays unknown, never proof.
  * - A model/summary-sourced record is skipped: self-report is never proof.
- * - Shell/command results are judged by exit code (`card:'terminal'`); anything
- *   without a trusted success signal stays `unknown` with `assertion_passed:null`.
+ * - Shell/command results are judged by exit code, taken from the durable canonical
+ *   `tool.outcome` record the host hook writes (primary, and the only source a real
+ *   DSH session produces) or from a `card:'terminal'` meta (fallback shape). Either
+ *   way a result without a trusted numeric exit code stays `unknown` with
+ *   `assertion_passed:null`.
  * - Only a verification-class command (test/build/lint/typecheck runner) may
  *   associate with acceptance requirements. An irrelevant exit-0 command
  *   (echo/ls/cat/read/print) records its honest outcome but claims no
  *   requirement, so it can neither verify nor shadow a real verification
  *   (spec §12 A05: echo/unrelated writes do not satisfy acceptance).
- * - A verification command whose exit code is masked by a later `||`/`;`/`|`
- *   segment (or preceded by `||`) is also rejected, so `npm test || true` cannot
- *   pass off a failing test as success; `&&` neighbours are kept (failure propagates).
+ * - A verification command whose exit code is masked by a later segment (or preceded
+ *   by `||`) is also rejected, so `npm test || true` cannot pass off a failing test as
+ *   success. Which connectors mask depends on the dialect of the tool that ran it (see
+ *   MASKING_CONN); `&&` neighbours are kept in both (failure propagates).
  * - Association also requires a determinate (passed/failed) status, so an
  *   indeterminate record never claims a requirement either.
  */
@@ -190,22 +373,22 @@ function buildEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDiges
     .filter(r => r.class === 'acceptance' && r.applicability === 'applicable')
     .map(r => r.requirement_id)
   const out: Verification[] = []
+  const outcomes = outcomesByCallId(ctx)
   for (const c of ctx.recovery.calls) {
     if (!c.call || !c.result) continue
     if (modelSourced(c.call) || modelSourced(c.result)) continue
     const resultData = dataOf(c.result), callData = dataOf(c.call)
     const toolName = typeof callData.name === 'string' ? callData.name : 'unknown'
-    const meta = resultData.meta
-    const terminal = !!meta && typeof meta === 'object' && meta.card === 'terminal'
-    const exitCode = terminal && typeof meta.exitCode === 'number' ? meta.exitCode : null
+    const t = terminalOf(outcomes.get(c.tool_call_id), callData, resultData)
+    const exitCode = t ? t.exit : null
     const hostFailed = c.result.result_status === 'failed' || c.status === 'failed'
     let status: Status, assertionPassed: boolean | null, requiresExitCode = false
     if (hostFailed) { status = 'failed'; assertionPassed = false }
-    else if (terminal && exitCode !== null) { requiresExitCode = true; assertionPassed = exitCode === 0; status = exitCode === 0 ? 'passed' : 'failed' }
+    else if (t) { requiresExitCode = true; assertionPassed = t.exit === 0; status = t.exit === 0 ? 'passed' : 'failed' }
     else { status = 'unknown'; assertionPassed = null }
     const determinate = status === 'passed' || status === 'failed'
     // Relevance + anti-masking gate: only an unmasked verification-class command speaks to acceptance.
-    const verifiesAcceptance = terminal && isTrustworthyVerification(commandText(callData))
+    const verifiesAcceptance = !!t && isTrustworthyVerification(t.cmd, dialectOf(callData.name))
     out.push({
       event_id: `verify:${c.result.event_id}`,
       task_id: c.result.task_id ?? task.task_id,
@@ -222,6 +405,286 @@ function buildEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDiges
   return out
 }
 
+/** True for a durable record carrying an actual human message, not synthetic feedback. */
+function isHumanMessage(r: EvidenceRecord): boolean {
+  return r.type === 'session.user/message' && dataOf(r)?.source?.kind === 'user'
+}
+/** The text parts of a message record's payload. */
+function messageText(payload: unknown): string {
+  const content = (payload as any)?.data?.content
+  return (Array.isArray(content) ? content : []).filter((p: any) => p?.type === 'text').map((p: any) => p.text).join('\n')
+}
+/** The latest human message in the durable log, or undefined when there is none. */
+function latestHumanMessage(ctx: ResolveAuditContext): EvidenceRecord | undefined {
+  return [...ctx.records].reverse().find(r => isHumanMessage(r))
+}
+
+/**
+ * Task type as classified by the host from the human request (see classify.ts).
+ * Read from the durable `task.classification` record the host persists per
+ * objective revision; if absent, re-derived from the latest human message; never
+ * from model output. Unknown/absent → `code` (strictest), failing closed.
+ */
+function readTaskType(ctx: ResolveAuditContext): TaskType {
+  for (const r of [...ctx.records].reverse()) {
+    if (r.type === 'task.classification') {
+      const t = (r.payload as any)?.task_type
+      if (isTaskType(t)) return t
+    }
+  }
+  const human = latestHumanMessage(ctx)
+  return human ? classifyTaskType(messageText(human.payload)) : 'code'
+}
+
+/**
+ * The human request the current classification was derived from, by following the
+ * `task.classification` record's `source_ref` back to that exact message; the latest
+ * human message when no classification was persisted. An evidence template matches
+ * its artifact against this text, so it comes from durable host records only — a
+ * model cannot widen its own target by describing the work differently.
+ */
+function humanRequestText(ctx: ResolveAuditContext): string {
+  const ref = (ctx.records.filter(r => r.type === 'task.classification').at(-1)?.payload as any)?.source_ref
+  if (typeof ref === 'string' && ref) {
+    const src = ctx.records.find(r => r.event_id === ref)
+    if (src && isHumanMessage(src)) return messageText(src.payload)
+  }
+  const human = latestHumanMessage(ctx)
+  return human ? messageText(human.payload) : ''
+}
+
+/** File-path arguments on a tool call. */
+function pathsForCall(callData: any): string[] {
+  const out: string[] = []
+  const raw = callData?.arguments
+  let parsed: any = raw
+  if (typeof raw === 'string') { try { parsed = JSON.parse(raw) } catch { parsed = undefined } }
+  if (parsed && typeof parsed === 'object')
+    for (const k of ['path', 'file_path', 'filePath', 'target', 'filename', 'file', 'notebook_path'])
+      if (typeof parsed[k] === 'string') out.push(parsed[k])
+  return out
+}
+
+const WRITE_TOOL = /(write|edit|create|patch|save|append|str_?replace|apply|overwrite)/i
+/**
+ * Tools that consult a source outside the workspace. Every alternative is an
+ * external indicator. A bare `search`/`retriev`/`query` is deliberately NOT
+ * accepted: local retrieval tools are commonly named `search_files` or
+ * `codebase_search`, and one local hit is not research. A tool whose name does not
+ * say where it looks fails closed.
+ */
+const EXTERNAL_SOURCE_TOOL = /(web|browse|browser|http|url|fetch|curl|wget|scrape|crawl|internet|online|serp|playwright)/i
+/** A complete, host-sourced, non-failed call/result pair (narrows call+result to defined). */
+const hostOk = <T extends { call?: EvidenceRecord; result?: EvidenceRecord; status: Status }>(c: T): c is T & { call: EvidenceRecord; result: EvidenceRecord } =>
+  !!c.call && !!c.result && !modelSourced(c.call) && !modelSourced(c.result)
+  && c.result.result_status !== 'failed' && c.status !== 'failed'
+
+/** Conventional documentation basenames: these name a target even without an extension. */
+const DOC_NAME = /\b(?:readme|changelog|licen[cs]e|contributing|notice|security|code_of_conduct)\b/gi
+/**
+ * Path-shaped tokens in a request: a slash-containing path, or a name carrying an
+ * alphabetic extension. Ordinary words and version numbers (`v2.0`) are not targets,
+ * so a request that names nothing falls through to the document-shape check.
+ */
+const PATH_TOKEN = /(?:[A-Za-z0-9_.@+\-]+[\\/])+[A-Za-z0-9_.@+\-]*[\\/]?|[A-Za-z0-9_@+\-]+\.[A-Za-z][A-Za-z0-9]{0,7}\b/g
+/** A URL is a reference to read, not a target to write. */
+const URL = /[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+|\bwww\.\S+/gi
+
+interface NamedTarget { norm: string; base: string; stem: string; dir: boolean }
+
+/**
+ * The file and directory targets the human request names explicitly. URLs are dropped
+ * whole first, so neither their host nor their path segments can be mistaken for a
+ * target and reject every legitimate artifact.
+ */
+function namedTargets(request: string): NamedTarget[] {
+  const text = request.replace(URL, ' ')
+  const out: NamedTarget[] = []
+  const add = (raw: string, dir: boolean): void => {
+    const norm = slashOf(raw).replace(/\/+$/, ''), base = baseName(norm)
+    if (!base || out.some(o => o.norm === norm && o.dir === dir)) return
+    out.push({ norm, base, stem: stemOf(base), dir })
+  }
+  for (const m of text.matchAll(PATH_TOKEN)) add(m[0], /[\\/]$/.test(m[0]))
+  for (const m of text.matchAll(DOC_NAME)) add(m[0], false)
+  return out
+}
+
+/** Documentation extensions: the only ones a bare target name may carry. */
+const DOC_EXT = /\.(?:md|mdx|rst|adoc)$/
+/** Backup, editor-swap and scratch suffixes: a copy of the artifact, not the artifact. */
+const BACKUP_SUFFIX = /\.(?:bak|old|orig|tmp|temp|save|saved|copy|backup|swp|swo)$/
+/** True when a slash-normalized path's basename marks it as a backup or scratch copy. */
+function isBackupCopy(slashPath: string): boolean {
+  const base = baseName(slashPath)
+  return base.endsWith('~') || BACKUP_SUFFIX.test(base)
+}
+
+/**
+ * Does a written path answer one named target? Comparison is on the basename,
+ * case-insensitive. A target the request spelled with an extension must match it
+ * exactly; a bare target name (`README`) also accepts a documentation extension
+ * (`README.md`) and nothing else. So `README.bak`, `README.md~` and `README.txt` are
+ * not the README the human asked for — stem equality alone let a backup pass as the
+ * original.
+ */
+function answersTarget(slashPath: string, t: NamedTarget): boolean {
+  const base = baseName(slashPath)
+  if (base === t.base) return true
+  if (isBackupCopy(slashPath)) return false
+  if (t.dir) return slashPath.startsWith(`${t.norm}/`) || slashPath.includes(`/${t.norm}/`)
+  return !t.base.includes('.') && DOC_EXT.test(base) && stemOf(base) === t.stem
+}
+
+/** Documentation shape: a doc extension, or a file under a `docs/` directory. */
+function isDocShaped(slashPath: string): boolean {
+  return DOC_EXT.test(slashPath) || /(?:^|\/)docs\//.test(slashPath)
+}
+
+/**
+ * Does this artifact answer the docs request? A target the request names must match;
+ * when it names none, only a documentation-shaped file counts. A backup copy answers
+ * neither. An unrelated artifact mints no proof either way, so "I wrote something
+ * readable" is not completion.
+ */
+function answersDocsRequest(path: string, named: NamedTarget[]): boolean {
+  const n = slashOf(path)
+  return named.length ? named.some(t => answersTarget(n, t)) : !isBackupCopy(n) && isDocShaped(n)
+}
+
+/**
+ * docs template: a host_verifier proof per write/edit-class result whose target file
+ * the host can now open for reading AND that answers the human request (see
+ * `answersDocsRequest`). Keyed on the result event so repeated turns never collide.
+ * The proof comes from the host filesystem, never from the model saying "I wrote it".
+ */
+function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
+  const ids = acceptanceIds(task), out: Verification[] = []
+  if (!ids.length) return out
+  const named = namedTargets(humanRequestText(ctx))
+  for (const c of ctx.recovery.calls) {
+    if (!hostOk(c)) continue
+    const callData = dataOf(c.call), meta = dataOf(c.result).meta
+    const diff = !!meta && typeof meta === 'object' && meta.card === 'diff'
+    if (!diff && !WRITE_TOOL.test(typeof callData.name === 'string' ? callData.name : '')) continue
+    const candidates = pathsForCall(callData)
+    if (diff && Array.isArray(meta.diffs)) for (const d of meta.diffs) if (typeof d?.path === 'string') candidates.push(d.path)
+    const written = candidates.filter(p => hostReadable(p) && answersDocsRequest(p, named))
+    if (!written.length) continue
+    out.push({
+      event_id: `verify:${c.result.event_id}`, task_id: c.result.task_id ?? task.task_id,
+      objective_revision: c.result.objective_revision ?? task.objective_revision,
+      requirement_ids: ids, object_version_digest: objectDigest, environment_digest: envDigest,
+      status: 'passed', complete: true, source_kind: 'host_verifier',
+      verifier_ref: `dsh-host:docs-artifact:${written[0]}`, output_ref: c.result.output_ref ?? c.result.event_id,
+      requires_exit_code: false, exit_code: null, assertion_passed: true,
+    })
+  }
+  return out
+}
+
+/** The delivered response as durably recorded by the host; null when absent or empty. */
+function recordedDelivery(ctx: ResolveAuditContext): { ref: string; text: string } | null {
+  const assistant = ctx.records.filter(r => r.type === 'session.assistant/message').at(-1)
+  const text = assistantText(assistant?.payload)
+  return assistant && text.trim() ? { ref: assistant.event_id, text } : null
+}
+
+/** Host-observed queries to a source outside the workspace; local file reads do not count. */
+function externalSourceObserved(ctx: ResolveAuditContext): boolean {
+  return ctx.recovery.calls.some(c => hostOk(c) && EXTERNAL_SOURCE_TOOL.test(typeof dataOf(c.call).name === 'string' ? dataOf(c.call).name : ''))
+}
+
+/**
+ * Host-observed operation outcomes: unmasked terminal results of commands that
+ * actually invoke an entry point. Exit codes come from the durable canonical outcome
+ * (see `terminalOf`). A noop (`echo`, `ls`, `cat`, ...) exits 0 without operating on
+ * anything, so it is dropped here and can neither verify nor contribute to the object
+ * digest.
+ */
+function opsOutcomes(ctx: ResolveAuditContext): Array<{ eventId: string; ref: string; cmd: string; exit: number }> {
+  const out: Array<{ eventId: string; ref: string; cmd: string; exit: number }> = []
+  const outcomes = outcomesByCallId(ctx)
+  for (const c of ctx.recovery.calls) {
+    if (!hostOk(c)) continue
+    const t = terminalOf(outcomes.get(c.tool_call_id), dataOf(c.call), dataOf(c.result))
+    if (!t) continue
+    const dialect = dialectOf(dataOf(c.call).name)
+    if (hasMaskedExit(t.cmd, dialect) || !runsOpsEntry(t.cmd)) continue
+    out.push({ eventId: c.result.event_id, ref: c.result.output_ref ?? c.result.event_id, cmd: t.cmd, exit: t.exit })
+  }
+  return out
+}
+
+function acceptanceIds(task: TaskContract): string[] {
+  return task.requirements.filter(r => r.class === 'acceptance' && r.applicability === 'applicable').map(r => r.requirement_id)
+}
+
+/**
+ * research template: the delivered content is durably recorded by the host AND the
+ * model consulted at least one source outside the workspace. Keyed on the recorded
+ * delivery event. Without a recorded delivery or an external query, no proof (fail
+ * closed) — a conclusion drawn from nothing but local files is not research.
+ */
+function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
+  const ids = acceptanceIds(task)
+  const delivery = recordedDelivery(ctx)
+  if (!ids.length || !delivery || !externalSourceObserved(ctx) || !objectDigest) return []
+  return [{
+    event_id: `verify:${delivery.ref}`, task_id: task.task_id, objective_revision: task.objective_revision,
+    requirement_ids: ids, object_version_digest: objectDigest, environment_digest: envDigest,
+    status: 'passed', complete: true, source_kind: 'host_verifier',
+    verifier_ref: 'dsh-host:research-delivery', output_ref: delivery.ref,
+    requires_exit_code: false, exit_code: null, assertion_passed: true,
+  }]
+}
+
+/**
+ * ops template: the actual entry point ran and the host observed a determinate,
+ * unmasked exit 0. A masked (`|| true`, `;`, pipe), non-zero, or absent result is no
+ * proof, and neither is a noop command (`echo`, `ls`, `cat`, ...) that exits 0
+ * without operating on anything. Keyed on the terminal result event.
+ */
+function buildOpsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
+  const ids = acceptanceIds(task)
+  const ok = opsOutcomes(ctx).filter(o => o.exit === 0)
+  if (!ids.length || !ok.length || !objectDigest) return []
+  const o = ok[0]
+  return [{
+    event_id: `verify:${o.eventId}`, task_id: task.task_id, objective_revision: task.objective_revision,
+    requirement_ids: ids, object_version_digest: objectDigest, environment_digest: envDigest,
+    status: 'passed', complete: true, source_kind: 'host_verifier',
+    verifier_ref: `dsh-host:ops-entry:${o.cmd.slice(0, 80)}`, output_ref: o.ref,
+    requires_exit_code: false, exit_code: o.exit, assertion_passed: true,
+  }]
+}
+
+/**
+ * Discussion owes no acceptance artifact. The host authority excludes the
+ * placeholder acceptance requirement (authorized, with provenance); `hard`
+ * constraints are left untouched and still fail closed.
+ */
+function discussionTask(task: TaskContract, ctx: ResolveAuditContext): TaskContract {
+  const ref = ctx.records.filter(r => r.type === 'task.classification').at(-1)?.event_id ?? `dsh:${ctx.session_id}:discussion`
+  return { ...task, requirements: task.requirements.map(r => r.class === 'acceptance'
+    ? { ...r, applicability: 'not_applicable' as const,
+        exclusion: { authorized: true, source_ref: ref, reason: 'discussion task: no acceptance artifact required' } }
+    : r) }
+}
+
+/**
+ * Object digest by type. File scope when files were touched; for research/ops the
+ * verified object is the delivered content / observed outcome, so fall back to a
+ * digest of that (keeps the proof's digest non-empty and equal to the input's).
+ */
+function objectDigestFor(type: TaskType, ctx: ResolveAuditContext): string {
+  const fileDigest = computeObjectDigest(ctx.records)
+  if (fileDigest || type === 'code' || type === 'docs' || type === 'discussion') return fileDigest
+  if (type === 'research') { const d = recordedDelivery(ctx); return d ? sha256({ object: 'research-delivery', text: d.text }) : '' }
+  const outcomes = opsOutcomes(ctx)
+  return outcomes.length ? sha256({ object: 'ops-outcomes', outcomes }) : ''
+}
+
 /**
  * Hard constraints are listed one-by-one. The host cannot confirm compliance of
  * an arbitrary hard requirement from tool events alone, so each stays `unknown`
@@ -235,11 +698,28 @@ function buildHardChecks(task: TaskContract): HardConstraintCheck[] {
   }))
 }
 
+/**
+ * A proof's identity: which tool result it came from AND which object version it attests.
+ * The resolver re-mints proofs for every call on every turn, while the object digest moves
+ * with the working tree. With a bare `verify:<result id>`, turn two therefore re-recorded
+ * the same id with a different digest, and the ledger's idempotency check threw
+ * `evidence_event_id_conflict` out of the turn-stopping hook: no state, no decision and no
+ * repair prompt followed, so the gate died silently for the rest of the session. Versioning
+ * the id makes a re-mint a new record instead of a conflict, which is what the audit already
+ * expects — it takes the latest proof and rejects the ones whose digest no longer matches.
+ */
+function proofVersionId(proof: Verification): Verification {
+  const tag = proof.object_version_digest
+    ? createHash('sha256').update(proof.object_version_digest).digest('hex').slice(0, 12)
+    : 'nocontent'
+  return { ...proof, event_id: `${proof.event_id}:${tag}` }
+}
+
 export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 'previous'> {
-  const task = withConfirmedApplicability(ctx.task)
-  const objectDigest = computeObjectDigest(ctx.records)
+  const taskType = readTaskType(ctx)
+  const confirmed = withConfirmedApplicability(ctx.task)
+  const objectDigest = objectDigestFor(taskType, ctx)
   const envDigest = computeEnvironmentDigest(ctx)
-  const evidence = buildEvidence(ctx, task, objectDigest, envDigest)
 
   // Host-side check: the candidate body must equal the agent's final message as
   // durably recorded. No recorded message → unknown (fails closed).
@@ -250,7 +730,36 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
     ? { status: 'consistent', source_ref: assistant.event_id }
     : { status: 'contradictory', source_ref: assistant.event_id }
 
-  const candidate: Candidate = { claims_success: true, response_kind: 'final_delivery', text: ctx.response, requirement_claims: [] }
+  // Type → acceptance template (spec §4). Each type is satisfied only by its own
+  // host-observed artifact, and only one that answers this human request: a document
+  // the request asked for, a state-changing operation entry point, a query to a
+  // source outside the workspace. There is deliberately NO fallback to the `code`
+  // template — running the test suite is free, so borrowing it let an unrelated
+  // `npm test` close a docs/research/ops task and made the request matching above
+  // decorative. No own artifact means `evidence_missing`, failing closed. The type
+  // came from the human request only — a model calling its work "discussion" cannot
+  // select that template.
+  let task = confirmed
+  let candidate: Candidate = { claims_success: true, response_kind: 'final_delivery', text: ctx.response, requirement_claims: [] }
+  let evidence: Verification[]
+  if (taskType === 'discussion') {
+    task = discussionTask(confirmed, ctx)
+    candidate = { claims_success: false, response_kind: 'discussion', text: ctx.response, requirement_claims: [] }
+    evidence = []
+  } else if (taskType === 'docs') {
+    evidence = buildDocsEvidence(ctx, confirmed, objectDigest, envDigest)
+  } else if (taskType === 'research') {
+    evidence = buildResearchEvidence(ctx, confirmed, objectDigest, envDigest)
+  } else if (taskType === 'ops') {
+    evidence = buildOpsEvidence(ctx, confirmed, objectDigest, envDigest)
+  } else {
+    evidence = buildEvidence(ctx, confirmed, objectDigest, envDigest)
+  }
+
+  // Version the proof ids before anything can reference them (decision.evidence_refs, a
+  // blocker's evidence_ref): an id is only ever written once, under one object version.
+  evidence = evidence.map(proofVersionId)
+
   const responseSeq = (assistant?.payload as any)?.seq ?? -1
   return {
     request_id: `${ctx.session_id}:${ctx.turn}:${responseSeq}`,
