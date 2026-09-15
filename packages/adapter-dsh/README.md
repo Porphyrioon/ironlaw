@@ -18,9 +18,34 @@ DSH extension points themselves.
 | Destructive-action blocking | `tools/pre-execute` (waterfall) | In `enforcer` mode, blocks destructive tools before they run |
 | Durable session evidence | `session/event` | Appends every durable session event and tracks per-turn tool evidence |
 | Completion gate | `agent/turn-stopping` (serial) | Before a turn closes, requires verifiable tool evidence; otherwise steers a repair prompt back to the agent |
+| Completion adjudication | `agent/turn-stopping` (serial) | A pure adjudicator returns one of six verdicts from a versioned task contract and host-verified evidence; a `resolveAudit` resolver builds that evidence from durable host events only |
+| Context governance | library API (`ContextStore`, `AdmissionController`, `DependencyRetriever`) | Three-phase compaction transaction, recoverable archive index, ledger recovery, and admission control under a final-render token budget |
 
 The evidence ledger is host-agnostic (`host: 'dsh'`), so the same evidence
 chain can span DSH and the other IronLaw adapters.
+
+### Evidence-based completion
+
+The completion gate no longer asks "did a tool run this round". It asks whether
+every applicable acceptance item of the current task has still-valid evidence.
+The trusted boundary is a `resolveAudit` resolver that assembles its input from
+durable host events only: the candidate body is compared to the agent's final
+message as recorded, and one `host_verifier` proof is built per complete
+`tool.call` / `tool.result` pair. A result counts as acceptance evidence only
+when the command is a verification-class invocation whose exit code reaches the
+host unmasked — `echo` verifies nothing, and `npm test || true` is rejected
+because the trailing segment eats the exit code.
+
+### Context governance
+
+Compaction is treated as budget-constrained task-state management: a three-phase
+transaction (`prepare` / `validate` / `commit`, with a rollback pointer), a
+recoverable archive index, ledger recovery from the append-only log, and
+admission control under a final-render token budget. An item that was just
+evicted is not re-injected on a mere similarity hit. An offline four-strategy
+harness compares dependency-driven retention against age, similarity, and length
+baselines; on its synthetic fixture it reports `evidence_insufficient` rather
+than claiming a production benefit.
 
 ## Install
 

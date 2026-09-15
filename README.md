@@ -304,7 +304,7 @@ Its trusted boundary is a `resolveAudit` resolver that assembles the verdict inp
 - **evidence** — one `host_verifier` proof per complete `tool.call` / `tool.result` pair, paired by native call id. A half pair, or a model/summary-sourced record, is never proof.
 - **relevance** — a result counts as acceptance evidence only when the command is a verification-class invocation (test/build/lint/typecheck runners, a conservative whitelist that fails closed) and its exit code reaches the host unmasked. `echo`, `ls`, `cat` and reads verify nothing; `npm test || true` and `npm test; true` are rejected because the trailing segment eats the exit code; a leading `cd x && npm test` is kept.
 
-Context governance is implemented alongside: a three-phase compaction transaction (prepare / validate / commit with fsync, read-back, atomic pointer swap and a rollback pointer), a recoverable archive index, ledger recovery from the append-only NDJSON log, and admission control under a final-render token budget.
+Context governance is a companion capability, described in its own section below.
 
 ### Verification
 
@@ -313,6 +313,28 @@ The monorepo suite passes 107 tests (adapter-dsh 88, cli 6, memory 13) with a cl
 ### Effect
 
 With the resolver in place, a task with a real unmasked verification run is accepted, and a task without one is repaired instead of rubber-stamped; the two false-success paths above are closed. Remaining boundaries are documented rather than hidden: subshell grouping is treated conservatively (fails closed), a single `&` background run is not yet classified as masking, and a verification command is currently associated with all applicable acceptance items rather than a per-item check binding.
+
+## IronLaw 2.0: context governance
+
+### Design principle
+
+Compaction is budget-constrained task-state management, not a rewrite schedule. The question is which information must stay resident, which may be summarized, and which should leave the active window while remaining recoverable. Value is conditional on the current task and its future dependencies, not on age, similarity, or how often an item appeared: a short user constraint ("do not publish yet") can outweigh megabytes of build log.
+
+### Implementation
+
+- **Three-phase compaction transaction.** `prepare` fixes the current event sequence and task revision, persists the original text, verifies it reads back, and only then summarizes. `validate` re-checks the original digest, the retained capsule, and the facts/assumptions/unknowns partition; a dropped hard constraint, todo, cause, or evidence reference fails the transaction. `commit` re-verifies under the ledger and version locks, writes an immutable version, and then atomically renames the current pointer while keeping a rollback pointer. A failed transaction leaves the old version in place.
+- **Recoverable archive index.** An archived entry carries when/version, where/environment, object, purpose, cause/dependency, action, and result, plus source, certainty, validity, an acceptance link, and a recovery location. A failed retrieval returns `missing`; it never fabricates.
+- **Ledger recovery.** The append-only NDJSON ledger is re-opened after compaction or restart; `tool.call` / `tool.result` pairs align by native id, and a lost result stays `unknown`.
+- **Admission control.** Budget is measured on the final rendered tokens. Candidates are deduplicated and checked for source, version, and scope before selection. An item that was just evicted is not re-injected on a mere similarity hit: only a new dependency, an explicit request, or a state change reloads it.
+- **Offline calibration.** A four-strategy harness compares dependency-driven retention against age, similarity, and length baselines; dependency-triggered retrieval and cache cost accounting sit alongside it.
+
+### Verification
+
+The adapter suite exercises the compaction transaction, the archive index, ledger recovery, and admission control; the calibration harness runs deterministically and reports micro-aggregated metrics per strategy.
+
+### Effect
+
+On a synthetic replay fixture the dependency strategy deleted no critical item (0/9) where all three baselines deleted three (3/9). The harness labels that result as what it is — `evidence_insufficient` — because a deterministic slice is not a statistical sample and the tokenizer is explicit fixture units, not a model tokenizer. Boundaries are stated rather than hidden: the adapter is not wired to a host's native compact/rewrite, `DROP_ACTIVE` is deliberately disabled (so there is no cumulative drop budget yet), and no production token or cost figure is claimed.
 
 ## Multi-host usage
 
