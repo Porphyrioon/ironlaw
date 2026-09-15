@@ -515,3 +515,47 @@ test('E2 a collision on a derived record cannot kill the decision', t => {
     assert.equal(conflicts[0].payload.type, 'task.classification')
   } finally { EvidenceLedger.prototype.record = original }
 })
+
+// A shell-mediated edit leaves no diff meta and no write-tool call. It used to be invisible
+// twice over: the object scope stayed empty (so the object digest was '' and every acceptance
+// item became evidence_stale) and a document written that way could not answer a docs request.
+test('E3 a document written through a shell is observable', t => {
+  const root = fixture(t), readme = join(root, 'README.md')
+  writeFileSync(readme, '# T\ninstall\n')
+  const h = host(root)
+  user(h, '更新 README 文档，补充安装说明')
+  shell(h, 'w1', `printf '# T\\ninstall\\n' > "${readme}"`, 0, 2, 3)
+  assistant(h, 'README 已更新。', 4)
+  h.stop(1)
+  assert.equal(taskType(root), 'docs')
+  assert.equal(decision(root).verdict, 'verified_complete')
+})
+
+// The same shape for a code task: the only change was made by a shell command, so the object
+// scope has to include the file that command wrote, or a real verification run cannot land.
+test('E4 a file changed only through a shell enters the object scope', t => {
+  const root = fixture(t), file = join(root, 'login.js')
+  writeFileSync(file, 'b\n')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  shell(h, 'w1', `printf 'c\\n' > "${file}"`, 0, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+  const d = decision(root)
+  assert.equal(d.verdict, 'verified_complete')
+  assert.ok(!d.missing_requirements.some(m => m.missing_reason === 'evidence_stale'))
+})
+
+// A masked shell write must not answer a docs request: the aggregate exit code no longer
+// speaks for the write.
+test('E5 a masked shell write does not answer a docs request', t => {
+  const root = fixture(t), readme = join(root, 'README.md')
+  writeFileSync(readme, '# T\ninstall\n')
+  const h = host(root)
+  user(h, '更新 README 文档，补充安装说明')
+  shell(h, 'w1', `printf '# T\\ninstall\\n' > "${readme}" || true`, 0, 2, 3)
+  assistant(h, 'README 已更新。', 4)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete')
+})

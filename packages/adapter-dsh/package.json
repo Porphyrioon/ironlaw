@@ -1,6 +1,6 @@
 {
   "name": "@ironlaw/adapter-dsh",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "description": "IronLaw governance and evidence plugin for DeepSeek Harness (DSH): records tool-call evidence, blocks destructive actions in enforcer mode, and gates turn completion on verifiable evidence.",
   "type": "module",
   "license": "MIT",

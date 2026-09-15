@@ -51,6 +51,35 @@ const stemOf = (base: string): string => base.replace(/\.[^.]+$/, '')
 /** Forward slashes and lowercase, the form every path comparison here uses. */
 const slashOf = (path: string): string => path.replace(/\\/g, '/').toLowerCase()
 
+/** Shell tools whose command text can name a file they wrote. */
+const SHELL_TOOL = /^(?:pwsh|powershell|bash|sh|dash|zsh|ksh|fish|csh|tcsh|cmd)$/i
+/**
+ * Paths a shell command writes to. A shell-mediated edit leaves no diff meta, so it was both
+ * outside the object scope (an empty digest turned every acceptance item into
+ * `evidence_stale`) and unable to answer a docs request. Only explicit write constructs
+ * count, and every candidate is later required to be a host-readable regular file, so a path
+ * that merely appears inside quoted text cannot enter the scope.
+ */
+function shellWriteTargets(command: string): string[] {
+  const out = new Set<string>()
+  const clean = (token: string): string => token.replace(/^["']+|["']+$/g, '')
+  for (const m of command.matchAll(/(?:^|[^&>])>>?\s*("[^"]+"|'[^']+'|[^\s;&|<>]+)/g)) {
+    const target = clean(m[1])
+    if (target && !/^&\d*$/.test(target)) out.add(target)
+  }
+  for (const m of command.matchAll(/\b(?:tee|Set-Content|Add-Content|Out-File)\b([^\n;&|]*)/gi))
+    for (const token of m[1].trim().split(/\s+/)) {
+      const target = clean(token)
+      if (target && !target.startsWith('-')) out.add(target)
+    }
+  for (const m of command.matchAll(/\bsed\b[^\n;&|]*?\s-i\S*\s+([^\n;&|]*)/gi)) {
+    const operands = m[1].trim().split(/\s+/).map(clean).filter(t => t && !t.startsWith('-'))
+    const target = operands.at(-1)
+    if (target) out.add(target)
+  }
+  return [...out]
+}
+
 /**
  * Affected paths: DSH diff metas (mutations report `card:'diff'` with `diffs[].path`),
  * `meta.locations`, plus the path-like arguments of any tool call. Reads and searches are
@@ -75,6 +104,8 @@ function affectedPaths(records: EvidenceRecord[]): string[] {
           if (typeof args?.[k] === 'string') paths.add(args[k])
       } catch { /* unparsed arguments carry no reliable path */ }
     }
+    if (r.type === 'tool.call' && SHELL_TOOL.test(typeof data.name === 'string' ? data.name : ''))
+      for (const target of shellWriteTargets(commandText(data))) paths.add(target)
   }
   return [...paths]
 }
@@ -562,13 +593,22 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
   const ids = acceptanceIds(task), out: Verification[] = []
   if (!ids.length) return out
   const named = namedTargets(humanRequestText(ctx))
+  const outcomes = outcomesByCallId(ctx)
   for (const c of ctx.recovery.calls) {
     if (!hostOk(c)) continue
     const callData = dataOf(c.call), meta = dataOf(c.result).meta
+    const callName = typeof callData.name === 'string' ? callData.name : ''
     const diff = !!meta && typeof meta === 'object' && meta.card === 'diff'
-    if (!diff && !WRITE_TOOL.test(typeof callData.name === 'string' ? callData.name : '')) continue
+    // A document written through a shell (a redirect, `sed -i`, `tee`) leaves no diff meta.
+    // It is still host-observable: the command names the target, the recorded outcome says the
+    // command succeeded unmasked, and the host can open the resulting file.
+    const command = SHELL_TOOL.test(callName) ? commandText(callData) : ''
+    const outcome = command ? outcomes.get(c.tool_call_id ?? '') : undefined
+    const shellWrote = !!command && !!outcome && outcome.exit === 0 && !hasMaskedExit(command, dialectOf(callName))
+    if (!diff && !shellWrote && !WRITE_TOOL.test(callName)) continue
     const candidates = pathsForCall(callData)
     if (diff && Array.isArray(meta.diffs)) for (const d of meta.diffs) if (typeof d?.path === 'string') candidates.push(d.path)
+    if (shellWrote) for (const p of shellWriteTargets(command)) candidates.push(p)
     const written = candidates.filter(p => hostReadable(p) && answersDocsRequest(p, named))
     if (!written.length) continue
     out.push({
