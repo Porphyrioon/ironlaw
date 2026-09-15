@@ -31,10 +31,27 @@ every applicable acceptance item of the current task has still-valid evidence.
 The trusted boundary is a `resolveAudit` resolver that assembles its input from
 durable host events only: the candidate body is compared to the agent's final
 message as recorded, and one `host_verifier` proof is built per complete
-`tool.call` / `tool.result` pair. A result counts as acceptance evidence only
-when the command is a verification-class invocation whose exit code reaches the
-host unmasked — `echo` verifies nothing, and `npm test || true` is rejected
-because the trailing segment eats the exit code.
+`tool.call` / `tool.result` pair.
+
+The task type is classified from the human request (`code`, `docs`, `ops`,
+`research`, `discussion`), and each type is satisfied only by its own
+host-observed artifact — a document write that answers the request, a delivered
+response backed by an external source query, a state-changing entry point, or no
+artifact at all for a discussion. No type borrows another's evidence, so a
+passing test suite cannot close a documentation request, and a model calling its
+work "discussion" cannot reclassify it.
+
+A result counts as acceptance evidence only when the command is a
+verification-class invocation whose exit code reaches the host unmasked. The exit
+code is not in the session event stream: the plugin persists it from the
+`tools/result` hook's canonical tool value, because a real ledger carries no
+structured exit code at all (measured: zero of 37k records). Masking is judged per
+shell dialect — POSIX treats `|`, `;`, `||` and newline as masking, PowerShell
+only `;`, `||` and newline, because a PowerShell pipeline preserves the exit code
+(`cmd /c exit 3 | Select-Object -Last 1` still reports failure, while
+`cmd /c exit 3; Write-Host hi` returns 0). An unrecognized tool name gets the
+stricter POSIX reading. `echo` verifies nothing, and `npm test || true` is
+rejected because the trailing segment eats the exit code.
 
 ### Context governance
 
@@ -70,9 +87,11 @@ Configuration is read from the environment (the bundle patch stays minimal):
 | `IRONLAW_EVIDENCE_ROOT` | `~/.ironlaw` | Directory for the `events.ndjson` evidence ledger |
 | `IRONLAW_DESTRUCTIVE_TOOLS` | built-in list | Comma-separated extra regex fragments to treat as destructive |
 
-The completion gate is on by default. It requires a turn to produce at least
-one successful tool result with no tool errors before it may close; otherwise
-the agent is steered a repair prompt instead of finishing.
+The completion gate is on by default. It requires each applicable acceptance item
+to carry still-valid host-observed evidence before the turn may close; otherwise
+the agent is steered a repair prompt instead of finishing, up to a bounded number
+of repairs. In `observe` mode (the default) it only steers; destructive tool calls
+are additionally blocked in `enforcer` mode.
 
 ## Develop
 
@@ -80,6 +99,7 @@ the agent is steered a repair prompt instead of finishing.
 npm install
 npm run build      # tsc -> lib/
 npm run typecheck
+npm test           # build + node --test tests/*.test.js
 ```
 
 Node.js 22+. The plugin is a function plugin (`name`/`inject`/`apply`) with no
