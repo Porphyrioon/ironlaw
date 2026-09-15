@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { EvidenceLedger, type EvidenceRecord } from './evidence.js'
 import { destructiveReason } from './policy.js'
 import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
+import { defaultResolveAudit } from './resolver.js'
 export const name = 'ironlaw'
 export const inject = ['tools', 'sessions', 'agents']
 export interface IronLawConfig {
@@ -89,14 +90,9 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     const sessionId = sessionIdOf(agent), task = taskFor(sessionId)
     const response = responses.get(sessionId) ?? { text: '', seq: -1 }
     const records = ledger.snapshot(sessionId)
-    const input: Omit<AuditInput, 'previous'> = config.resolveAudit?.({ session_id: sessionId, turn, task, response: response.text, records,
-      recovery: ledger.recover(sessionId) }) ?? {
-      request_id: `${sessionId}:${turn}:${response.seq}`, task,
-      candidate: { claims_success: true, response_kind: 'final_delivery', text: response.text, requirement_claims: [] },
-      candidate_check: { status: 'unknown', source_ref: '' }, evidence: [], hard_constraints_checked: [],
-      object_version_digest: '', context_state_digest: `turn:${turn}`, environment_digest: '', now: Date.now(),
-      recovery_events: records.filter(r => r.type === 'task.revision').map(r => r.payload as any),
-    }
+    const resolveCtx = { session_id: sessionId, turn, task, response: response.text, records,
+      recovery: ledger.recover(sessionId) }
+    const input: Omit<AuditInput, 'previous'> = config.resolveAudit?.(resolveCtx) ?? defaultResolveAudit(resolveCtx)
     const previous = ledger.auditState(sessionId, input.task.task_id)
     if (input.candidate?.text !== response.text) input.candidate_check = {
       status: 'contradictory', source_ref: `dsh:${sessionId}:${response.seq}`,
@@ -125,6 +121,8 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
 // Public protocol types and host-side fingerprint utility.
 export type { TaskContract, Requirement, Candidate, Verification, Decision, AuditState, AuditInput, RecoveryEvent, HardConstraintCheck, Verdict } from './audit.js'
 export { objectVersionDigest } from './fingerprint.js'
+export { defaultResolveAudit } from './resolver.js'
+export type { ResolveAuditContext } from './resolver.js'
 export { EvidenceLedger } from './evidence.js'
 export { ContextStore, retainCapsule } from './context.js'
 export type { ContextEntry, ContextStructure, ContextSummary, TaskCapsule, RetentionCapsule, ArchiveIndex, ContextVersion } from './context.js'
