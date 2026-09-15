@@ -1,145 +1,126 @@
-import type { Context } from '@deepseek-ai/cordis'
+﻿import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
 import { randomUUID } from 'node:crypto'
-import { EvidenceLedger } from './evidence.js'
+import { EvidenceLedger, type EvidenceRecord } from './evidence.js'
 import { destructiveReason } from './policy.js'
-import {
-  auditTurn,
-  isReadOnlyTool,
-  newTurnEvidence,
-  repairPrompt,
-  resetTurnEvidence,
-  type TurnEvidence,
-} from './audit.js'
-
-/**
- * IronLaw for DeepSeek Harness.
- *
- * A native Cordis plugin that hangs off the DSH extension points:
- *
- * - `tools/pre-execute` (waterfall): records tool-call intent and, in enforcer
- *   mode, blocks destructive actions before the tool body runs.
- * - `tools/result` (emit): records the tool outcome as durable evidence.
- * - `session/event` (emit): appends every durable session event to the
- *   evidence ledger and tracks per-turn tool evidence.
- * - `agent/turn-stopping` (serial): the completion gate — before an otherwise
- *   completed turn closes, it requires verifiable tool evidence and steers a
- *   repair prompt back into the agent when evidence is missing.
- */
+import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
 export const name = 'ironlaw'
 export const inject = ['tools', 'sessions', 'agents']
-
 export interface IronLawConfig {
-  /** 'observe' (default) records only; 'enforcer' also blocks destructive tools. */
   mode?: 'observe' | 'enforcer'
-  /** Evidence ledger directory. Defaults to ~/.ironlaw. */
   evidenceRoot?: string
-  /** Require tool evidence before a turn may close. Defaults to true. */
+  /** False is shadow-only; it cannot manufacture a verified verdict. */
   requireEvidence?: boolean
+  /** Trusted integration boundary, NOT model/tool-output JSON. Resolve authority,
+   * candidate/body consistency, fingerprints and requirement checks here.
+   * Without it the adapter explicitly reports unknown, with bounded feedback. */
+  resolveAudit?: (context: { session_id: string; turn: number; task: TaskContract;
+    response: string; records: EvidenceRecord[] }) => Omit<AuditInput, 'previous'>
 }
-
-function resolveMode(config: IronLawConfig): 'observe' | 'enforcer' {
-  if (config.mode === 'enforcer' || config.mode === 'observe') return config.mode
-  return process.env.IRONLAW_MODE === 'enforcer' ? 'enforcer' : 'observe'
-}
-
 function sessionIdOf(agent: { session?: { id?: unknown } } | undefined): string {
   const id = agent?.session?.id
   return typeof id === 'string' ? id : 'unknown'
 }
-
 export function apply(ctx: Context, config: IronLawConfig = {}): void {
-  const mode = resolveMode(config)
-  const requireEvidence = config.requireEvidence ?? true
+  const mode = config.mode ?? (process.env.IRONLAW_MODE === 'enforcer' ? 'enforcer' : 'observe')
   const ledger = new EvidenceLedger(config.evidenceRoot)
-  const evidenceBySession = new Map<string, TurnEvidence>()
-
-  const tracker = (sessionId: string): TurnEvidence => {
-    let evidence = evidenceBySession.get(sessionId)
-    if (!evidence) {
-      evidence = newTurnEvidence()
-      evidenceBySession.set(sessionId, evidence)
-    }
-    return evidence
+  const responses = new Map<string, { text: string; seq: number }>()
+  const taskFor = (sessionId: string): TaskContract => ledger.task(sessionId) ?? {
+    schema_version: 2, task_id: `unresolved:${sessionId}`, objective_revision: 1,
+    source_ref: `session:${sessionId}`, scope: ['unresolved'], status: 'active',
+    requirements: [{ requirement_id: 'AC-1', class: 'acceptance', source_kind: 'user_instruction',
+      source_ref: '', applicability: 'unknown', status: 'unknown' }],
   }
-
-  // 1) Pre-tool: record intent. Blocking is a monotonic guard, not this
-  //    short-circuitable waterfall (an earlier listener returning allow would
-  //    otherwise bypass IronLaw entirely).
   ctx.on('tools/pre-execute', async (exec, next) => {
-    const sessionId = sessionIdOf(exec.agent)
-    ledger.record(sessionId, 'tool.execute.before', { name: exec.name, arguments: exec.arguments })
+    ledger.record(sessionIdOf(exec.agent), 'tool.execute.before', { name: exec.name, arguments: exec.arguments })
     return next()
   })
-
-  if (mode === 'enforcer') {
-    ctx.tools.guard(exec => {
-      const reason = destructiveReason(exec.name, exec.arguments)
-      if (reason) {
-        ledger.record(sessionIdOf(exec.agent), 'policy.deny', { name: exec.name, reason })
-      }
-      return reason
-    })
-  }
-
-  // 2) Tool result: record the outcome as durable evidence.
+  if (mode === 'enforcer') ctx.tools.guard(exec => {
+    const reason = destructiveReason(exec.name, exec.arguments)
+    if (reason) ledger.record(sessionIdOf(exec.agent), 'policy.deny', { name: exec.name, reason })
+    return reason
+  })
   ctx.on('tools/result', (exec, result) => {
-    const sessionId = sessionIdOf(exec.agent)
-    ledger.record(sessionId, 'tool.execute.after', { name: exec.name, isError: result.isError })
+    ledger.record(sessionIdOf(exec.agent), 'tool.execute.after', { name: exec.name, isError: result.isError })
   })
-
-  // 3) Durable session events: append to the ledger and track turn evidence.
   ctx.on('session/event', (session, event) => {
-    // assistant/chunk is a high-frequency token stream; assistant/message
-    // already summarizes it, so don't synchronously append every chunk.
-    if (event.type !== 'assistant/chunk') {
-      ledger.record(session.id, `session.${event.type}`, { seq: event.seq, data: event.data })
+    if (event.type === 'assistant/chunk') return
+    const eventId = `dsh:${session.id}:${event.seq}`
+    if (ledger.snapshot(session.id).some(r => r.event_id === eventId)) return
+    const data = event.data as any
+    let task = taskFor(session.id)
+    // Only actual human messages revise the contract. Synthetic feedback retains provenance.
+    if (event.type === 'user/message' && data.source?.kind === 'user') {
+      const existing = ledger.task(session.id)
+      task = { ...task, task_id: existing?.task_id ?? randomUUID(),
+        objective_revision: existing ? existing.objective_revision + 1 : 1, source_ref: eventId }
+      ledger.record(session.id, 'task.contract', task, { task_id: task.task_id, objective_revision: task.objective_revision })
+      ledger.record(session.id, 'task.revision', { event_id: eventId, task_id: task.task_id, kind: 'user_revision',
+        requirement_ids: task.requirements.map(r => r.requirement_id), source_ref: eventId, observed: true }, { task_id: task.task_id })
     }
-
-    const evidence = tracker(session.id)
-    if (event.type === 'turn/start') {
-      resetTurnEvidence(evidence)
-    } else if (event.type === 'tool/call') {
-      evidence.toolCalls += 1
-      const data = event.data as { name?: string }
-      if (typeof data.name === 'string' && !isReadOnlyTool(data.name)) {
-        evidence.verificationCalls += 1
-      }
-    } else if (event.type === 'tool/result') {
-      evidence.toolResults += 1
-      const data = event.data as {
-        error?: { name: string; code: string }
-        message?: { content?: Array<{ isError?: boolean }> }
-      }
-      const infraError = Boolean(data.error)
-      const toolError = Boolean(data.message?.content?.[0]?.isError)
-      if (infraError || toolError) evidence.toolErrors += 1
+    if (event.type === 'assistant/message') responses.set(session.id, {
+      text: (data.message?.content ?? []).filter((p: any) => p.type === 'text').map((p: any) => p.text).join('\n'), seq: event.seq,
+    })
+    const callId = data.callId ?? data.message?.source?.callId
+      ?? data.message?.content?.find((p: any) => p.type === 'tool-result')?.toolCallId
+    const type = event.type === 'tool/call' ? 'tool.call' : event.type === 'tool/result' ? 'tool.result' : `session.${event.type}`
+    const error = !!data.error || (data.message?.content ?? []).some((p: any) => p.isError === true)
+    ledger.record(session.id, type, { seq: event.seq, data }, {
+      event_id: eventId, task_id: task.task_id, objective_revision: task.objective_revision,
+      turn_id: data.turn === undefined ? null : String(data.turn), tool_call_id: callId ?? null,
+      result_status: error ? 'failed' : 'unknown', output_ref: eventId,
+      source_kind: data.source?.kind ?? 'host_event',
+      started_at: type === 'tool.call' ? new Date().toISOString() : null,
+      ended_at: type === 'tool.result' ? new Date().toISOString() : null,
+    })
+    if (event.type === 'turn/end' && data.reason?.kind === 'aborted' && data.reason.reason?.kind === 'user') {
+      const { state, decision } = auditTurn({ request_id: eventId, task,
+        candidate: { claims_success: false, response_kind: 'cancellation_ack', text: '', requirement_claims: [] },
+        candidate_check: { status: 'consistent', source_ref: eventId }, cancellation: { source_kind: 'user_instruction', source_ref: eventId },
+        evidence: [], hard_constraints_checked: [], object_version_digest: '', context_state_digest: '', environment_digest: '', now: Date.now(),
+        previous: ledger.auditState(session.id, task.task_id) })
+      ledger.record(session.id, 'completion.state', state, { task_id: task.task_id })
+      ledger.record(session.id, 'completion.decision', decision, { task_id: task.task_id, event_id: decision.decision_id })
     }
   })
-
-  // 4) Completion gate: require verifiable evidence before a turn closes.
-  ctx.on('agent/turn-stopping', ({ agent }) => {
-    const sessionId = typeof agent.session?.id === 'string' ? agent.session.id : 'unknown'
-    const evidence = evidenceBySession.get(sessionId)
-    if (!evidence) return
-
-    const verdict = auditTurn(evidence, requireEvidence)
-    if (verdict === 'repair') {
-      evidence.repairCount += 1
-      ledger.record(sessionId, 'completion.repair', { ...evidence })
-      const message = {
-        id: randomUUID(),
-        role: 'user',
-        content: [{ type: 'text', text: repairPrompt(evidence) }],
-        source: { kind: 'user' },
-      }
+  ctx.on('agent/turn-stopping', ({ agent, turn }) => {
+    const sessionId = sessionIdOf(agent), task = taskFor(sessionId)
+    const response = responses.get(sessionId) ?? { text: '', seq: -1 }
+    const records = ledger.snapshot(sessionId)
+    const input: Omit<AuditInput, 'previous'> = config.resolveAudit?.({ session_id: sessionId, turn, task, response: response.text, records }) ?? {
+      request_id: `${sessionId}:${turn}:${response.seq}`, task,
+      candidate: { claims_success: true, response_kind: 'final_delivery', text: response.text, requirement_claims: [] },
+      candidate_check: { status: 'unknown', source_ref: '' }, evidence: [], hard_constraints_checked: [],
+      object_version_digest: '', context_state_digest: `turn:${turn}`, environment_digest: '', now: Date.now(),
+      recovery_events: records.filter(r => r.type === 'task.revision').map(r => r.payload as any),
+    }
+    const previous = ledger.auditState(sessionId, input.task.task_id)
+    if (input.candidate?.text !== response.text) input.candidate_check = {
+      status: 'contradictory', source_ref: `dsh:${sessionId}:${response.seq}`,
+    }
+    const replayed = previous && Object.hasOwn(previous.replay, input.request_id)
+    const { decision, state } = auditTurn({ ...input, previous })
+    ledger.record(sessionId, 'task.contract', { ...input.task, status: state.task_status }, { task_id: input.task.task_id, objective_revision: input.task.objective_revision })
+    for (const proof of input.evidence) ledger.record(sessionId, 'requirement.verification', proof, {
+      event_id: proof.event_id, task_id: proof.task_id, objective_revision: proof.objective_revision,
+      requirement_ids: proof.requirement_ids, tool_call_id: proof.tool_call_id ?? null,
+      source_kind: proof.source_kind, result_status: proof.status, output_ref: proof.output_ref,
+      object_version_digest: proof.object_version_digest, exit_code: proof.exit_code ?? null,
+    })
+    // Persist one full transaction before feedback; turn boundaries never reset attempts.
+    ledger.record(sessionId, 'completion.state', state, { task_id: input.task.task_id, objective_revision: input.task.objective_revision })
+    ledger.record(sessionId, 'completion.decision', decision, { task_id: input.task.task_id, event_id: decision.decision_id })
+    if (!replayed && decision.verdict === 'repair_required' && config.requireEvidence !== false) {
+      const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text: repairPrompt(decision) }],
+        source: { kind: 'system', name: 'ironlaw', decision_id: decision.decision_id } }
       agent.steer(message as Parameters<typeof agent.steer>[0])
-    } else if (verdict === 'failed') {
-      ledger.record(sessionId, 'completion.failed_unverified', { ...evidence })
-    } else {
-      ledger.record(sessionId, 'completion.verified', { ...evidence })
     }
   })
 }
+
+
+// Public protocol types and host-side fingerprint utility.
+export type { TaskContract, Requirement, Candidate, Verification, Decision, AuditState, AuditInput, RecoveryEvent, HardConstraintCheck, Verdict } from './audit.js'
+export { objectVersionDigest } from './fingerprint.js'
