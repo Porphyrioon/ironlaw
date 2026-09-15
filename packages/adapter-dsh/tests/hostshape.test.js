@@ -559,3 +559,28 @@ test('E5 a masked shell write does not answer a docs request', t => {
   h.stop(1)
   assert.notEqual(decision(root).verdict, 'verified_complete')
 })
+
+// Every user message advances the task revision, so a passing run from the previous revision
+// cannot close the current one. That case must not read as "you supplied nothing": the
+// decision has to say the evidence exists but is superseded, and the prompt has to say that
+// re-running the same command is the fix.
+test('E6 a passing run from an earlier revision reports evidence_superseded, not missing', t => {
+  const root = fixture(t), file = join(root, 'login.js')
+  writeFileSync(file, 'b\n')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  edit(h, 'e1', file, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+  assert.equal(decision(root).verdict, 'verified_complete')
+
+  user(h, '那现在解释一下你的改动', 7) // a new message = a new task revision
+  assistant(h, '我把返回值改成了 b。', 8)
+  h.stop(2)
+  const d = decision(root)
+  assert.equal(d.verdict, 'repair_required')
+  assert.deepEqual(d.missing_requirements.map(m => `${m.requirement_id}:${m.missing_reason}`), ['AC-1:evidence_superseded'])
+  assert.match(d.repair_action, /earlier task revision/)
+  assert.match(d.repair_action, /Re-run the same command in this revision/)
+})

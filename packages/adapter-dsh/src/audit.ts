@@ -1,4 +1,4 @@
-﻿import { createHash } from 'node:crypto'
+import { createHash } from 'node:crypto'
 export const POLICY_VERSION = 'ironlaw/2.0-p1'
 export const MAX_REPAIRS = 2
 export type Status = 'pending' | 'passed' | 'failed' | 'unknown' | 'stale'
@@ -112,7 +112,20 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
     if (r.applicability !== 'applicable') { add(r.requirement_id, 'applicability_unknown'); continue }
     const e = input.evidence.filter(e => e.task_id === task.task_id && e.objective_revision === task.objective_revision
       && e.requirement_ids.includes(r.requirement_id) && e.source_kind === 'host_verifier').at(-1)
-    if (!e) { add(r.requirement_id, 'evidence_missing'); continue }
+    if (!e) {
+      // Distinguish "this revision was never verified" from "it was verified under an earlier
+      // task revision". The revision advances with every user message, so the second case is
+      // the common one in a live session, and its fix is to re-run the same command — not to
+      // invent new evidence. The task's own requirement set and the object digest still decide
+      // validity; only the reported reason and its guidance differ.
+      const older = input.evidence.filter(v => v.task_id === task.task_id
+        && v.objective_revision !== task.objective_revision
+        && v.requirement_ids.includes(r.requirement_id) && v.source_kind === 'host_verifier')
+      const olderPassed = older.some(v => v.status === 'passed' && v.assertion_passed === true
+        && (typeof v.exit_code !== 'number' || v.exit_code === 0))
+      add(r.requirement_id, olderPassed ? 'evidence_superseded' : older.length ? 'verification_failed' : 'evidence_missing')
+      continue
+    }
     if (!input.object_version_digest || !input.environment_digest || e.object_version_digest !== input.object_version_digest
       || e.environment_digest !== input.environment_digest || (e.expires_at !== undefined && input.now >= e.expires_at)) {
       add(r.requirement_id, 'evidence_stale'); continue
@@ -156,8 +169,7 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
       || recoveries.some(e => e.kind === 'object_change' || e.kind === 'user_revision')
     if (state.repair_count < MAX_REPAIRS && newKeys.length && objectChangeVerified) {
       verdict = 'repair_required'; state.repair_count++; state.repair_keys.push(...keys)
-      repair = missing.map(m => `${m.requirement_id}: ${m.missing_reason}`).join('; ')
-        + '. Supply current requirement-linked evidence or honestly report the remaining gap.'
+      repair = missing.map(m => `${m.requirement_id}: ${m.missing_reason}`).join('; ') + '. ' + guidance(missing)
     } else { verdict = 'incomplete'; reasons.push('repair_budget_exhausted_or_duplicate') }
   } else if (c.response_kind === 'incomplete_report' || c.response_kind === 'blocked_report') {
     verdict = 'incomplete'; if (c.response_kind === 'blocked_report') reasons.push('blocker_unconfirmed')
@@ -172,6 +184,25 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
   state.replay_inputs[input.request_id] = inputDigest
   return { decision, state }
 }
+/**
+ * What to do about each gap, in the order a reader needs it. A bare reason code says that
+ * something is missing but not that the missing thing is a *re-run*: the common live case is a
+ * passing verification whose task revision has since advanced, where the fix is to run the
+ * same command again in the current revision. Reasons without specific guidance fall back to
+ * the generic sentence, so the message never becomes misleadingly precise.
+ */
+function guidance(missing: Array<{ missing_reason: string }>): string {
+  const byReason: Record<string, string> = {
+    evidence_missing: 'No verification-class run is recorded for this task revision. Run the project\'s own verification (its test, build or lint command) as a single unmasked command so the host records its exit code, then report.',
+    evidence_superseded: 'A passing verification run exists but is bound to an earlier task revision — the revision advances with each user message, so earlier evidence cannot close this one. Re-run the same command in this revision, then report.',
+    evidence_stale: 'The verification\'s object version no longer matches the current files, so it cannot speak for them. Re-run the verification after your last change, then report.',
+    verification_failed: 'The verification run failed. Fix the failure, re-run it, then report.',
+    evidence_unknown: 'The verification outcome is indeterminate (no exit code, no assertion result). Re-run it so the host records a determinate outcome.',
+  }
+  const lines = [...new Set(missing.map(m => byReason[m.missing_reason]).filter((line): line is string => !!line))]
+  return lines.length ? lines.join(' ') : 'Supply current requirement-linked evidence or honestly report the remaining gap.'
+}
+
 export function repairPrompt(decision: Decision): string {
   return `[IRONLAW_REPAIR:v2 decision=${decision.decision_id}] ${decision.repair_action ?? decision.reason_codes.join(', ')}`
 }
