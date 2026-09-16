@@ -149,7 +149,17 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
         && v.requirement_ids.includes(r.requirement_id) && v.source_kind === 'host_verifier')
       const olderPassed = older.some(v => v.status === 'passed' && v.assertion_passed === true
         && (typeof v.exit_code !== 'number' || v.exit_code === 0))
-      add(r.requirement_id, olderPassed ? 'evidence_superseded' : older.length ? 'verification_failed' : 'evidence_missing')
+      // The reason has to name what the host actually saw. A passing run whose captured files moved
+      // is stale evidence, not a failed run: reporting `verification_failed` sent the agent to fix
+      // a failure that never happened (found on a live session, 2026-09-16, in the 0.1.0 build).
+      // Older evidence that never ran a verification at all is not evidence of a failure either.
+      const olderStale = older.some(v => v.status === 'stale')
+      const olderFailed = older.some(v => v.status === 'failed' && v.requires_exit_code === true)
+      const reason = olderPassed ? 'evidence_superseded'
+        : olderStale ? 'evidence_stale'
+        : olderFailed ? 'verification_failed'
+        : 'evidence_missing'
+      add(r.requirement_id, reason)
       continue
     }
     if (!input.object_version_digest || !input.environment_digest || e.object_version_digest !== input.object_version_digest

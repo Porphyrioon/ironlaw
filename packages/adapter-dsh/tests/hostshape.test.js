@@ -496,6 +496,63 @@ test('T6b a change to a captured file does invalidate the run', t => {
   assert.deepEqual(d.missing_requirements.map(m => m.missing_reason), ['evidence_stale'])
 })
 
+// R7 (live session, 2026-09-16): a passing run whose files moved, with no run in the new revision,
+// was reported as `verification_failed` — the repair prompt told the agent to fix a failure that
+// never happened. Found on the real machine in the 0.1.0 build; the fixtures had never combined
+// "older revision" with "captured file moved".
+test('R7 an older passing run whose files moved is stale, not failed', t => {
+  const root = fixture(t), h = host(root), code = join(root, 'login.js')
+  writeFileSync(code, 'a\n')
+  user(h, '修复 login.js 的 bug 并跑测试')
+  edit(h, 'e1', code, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复。', 6)
+  h.stop(1)
+  assert.equal(decision(root).verdict, 'verified_complete')
+
+  writeFileSync(code, 'changed after the run\n')
+  edit(h, 'e2', code, 7, 8)
+  user(h, '继续修复 login 的问题', 9)
+  assistant(h, '继续。', 10)
+  h.stop(2)
+  const d = decision(root)
+  assert.deepEqual(d.missing_requirements.map(m => m.missing_reason), ['evidence_stale'],
+    `the files moved; nothing failed: ${JSON.stringify(d.missing_requirements)}`)
+  assert.doesNotMatch(d.repair_action ?? '', /run failed/i,
+    'the repair prompt must not report a failure that never happened')
+})
+
+test('R7 an older run that really failed is still reported as failed', t => {
+  const root = fixture(t), h = host(root), code = join(root, 'login.js')
+  writeFileSync(code, 'a\n')
+  user(h, '修复 login.js 的 bug 并跑测试')
+  edit(h, 'e1', code, 2, 3)
+  shell(h, 'v1', 'npm test', 1, 4, 5)
+  assistant(h, '已修复。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete')
+
+  user(h, '继续修复 login 的问题', 7)
+  assistant(h, '继续。', 8)
+  h.stop(2)
+  assert.deepEqual(decision(root).missing_requirements.map(m => m.missing_reason), ['verification_failed'])
+})
+
+test('R7 older evidence that never ran a verification is a missing run, not a failure', t => {
+  const root = fixture(t), h = host(root), code = join(root, 'login.js')
+  writeFileSync(code, 'a\n')
+  user(h, '修复 login.js 的 bug 并跑测试')
+  named(h, 'r1', 'read', { file_path: code }, 2, 3)
+  assistant(h, '看了一下。', 4)
+  h.stop(1)
+
+  user(h, '继续修复 login 的问题', 5)
+  assistant(h, '继续。', 6)
+  h.stop(2)
+  assert.deepEqual(decision(root).missing_requirements.map(m => m.missing_reason), ['evidence_missing'],
+    'a read is not a verification run, so its absence is not a failed one')
+})
+
 // T3 (third review): three ways of dropping an attempt each let an earlier success stand for
 // work that had not happened — a call whose result never arrived, a masked retry that cannot be
 // confirmed, and a different target entirely.
