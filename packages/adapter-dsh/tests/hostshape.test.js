@@ -298,6 +298,54 @@ test('R2 a remounted plugin recovers the scope, and still invalidates after a ch
   assert.notEqual(decision(root).verdict, 'verified_complete', 'a recovered scope must still invalidate')
 })
 
+// R3 (second review): collecting only usable successes and then claiming "the latest attempt"
+// let a later host-reported failure be invisible, so an earlier success survived it.
+test('R3 a later host-error failure of the same entry point is not success', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '部署到生产环境')
+  shell(h, 'd1', './deploy.sh prod', 0, 2, 3)
+  h.emit('tool/call', { turn: 1, callId: 'd2', name: 'pwsh', arguments: JSON.stringify({ command: './deploy.sh prod' }) }, 4)
+  h.toolResultHook('d2', 'pwsh', { command: './deploy.sh prod' }, { isError: true })
+  h.emit('tool/result', sessResult('d2'), 5)
+  assistant(h, '已部署。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete',
+    'the newest attempt failed, whatever the earlier one did')
+})
+
+// R4: escaping is dialect-specific. A backtick-escaped `>` in PowerShell is text; treating it
+// as a redirect let a command that printed a path stand in for a document write.
+test('R4 a backtick-escaped redirect is text, not a write', t => {
+  const root = fixture(t), readme = join(root, 'README.md')
+  writeFileSync(readme, 'unchanged\n')
+  const h = host(root)
+  user(h, '更新 README 文档，补充安装说明')
+  shell(h, 'w1', `Write-Output \`> ${readme}`, 0, 2, 3, 'pwsh')
+  assistant(h, 'README 已更新。', 4)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete')
+})
+
+// R5: a legitimate write must still be recognised — quoted or bare Windows paths included,
+// whatever the write construct. Blanking quoted spans destroyed exactly these.
+test('R5 quoted and bare Windows paths written by Set-Content or tee still verify', t => {
+  const forms = [
+    path => `Set-Content -LiteralPath "${path}" -Value new`,
+    path => `Set-Content -LiteralPath ${path} -Value new`,
+    path => `echo new | tee "${path}"`,
+  ]
+  for (const form of forms) {
+    const root = fixture(t), readme = join(root, 'README.md')
+    writeFileSync(readme, '# T\n')
+    const h = host(root)
+    user(h, '更新 README 文档，补充安装说明')
+    shell(h, 'w1', form(readme), 0, 2, 3, 'pwsh')
+    assistant(h, 'README 已更新。', 4)
+    h.stop(1)
+    assert.equal(decision(root).verdict, 'verified_complete', `not recognised: ${form(readme)}`)
+  }
+})
+
 // The non-shell templates keep working on the real shapes.
 test('G docs: a real edit with card-free diffs meta still verifies', t => {  const root = fixture(t), readme = join(root, 'README.md'); writeFileSync(readme, '# Title\n')
   const h = host(root)

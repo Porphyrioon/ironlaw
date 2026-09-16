@@ -78,7 +78,7 @@ function affectedPaths(records: EvidenceRecord[]): string[] {
       } catch { /* unparsed arguments carry no reliable path */ }
     }
     if (r.type === 'tool.call' && SHELL_TOOL.test(typeof data.name === 'string' ? data.name : ''))
-      for (const target of shellWriteTargets(commandText(data))) paths.add(target)
+      for (const target of shellWriteTargets(commandText(data), dialectOf(data.name))) paths.add(target)
   }
   return [...paths]
 }
@@ -616,7 +616,7 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
     if (!diff && !shellWrote && !WRITE_TOOL.test(callName)) continue
     const candidates = pathsForCall(callData)
     if (diff && Array.isArray(meta.diffs)) for (const d of meta.diffs) if (typeof d?.path === 'string') candidates.push(d.path)
-    if (shellWrote) for (const p of shellWriteTargets(command)) candidates.push(p)
+    if (shellWrote) for (const p of shellWriteTargets(command, dialectOf(callName))) candidates.push(p)
     const written = candidates.filter(p => hostReadable(p) && answersDocsRequest(p, named))
     if (!written.length) continue
     // The artifact must be attested at the version captured when the write happened; without
@@ -661,24 +661,41 @@ function lastExternalQuery(ctx: ResolveAuditContext): { ref: string; digest: str
   return found
 }
 
+/** One observed attempt at an operation entry point, successful or not. */
+interface OpsAttempt {
+  eventId: string; ref: string; cmd: string
+  outcome: 'passed' | 'failed' | 'unknown'
+  exit: number | null; digest: string; revision: number | null
+}
+
 /**
- * Host-observed operation outcomes: unmasked terminal results of commands that
- * actually invoke an entry point. Exit codes come from the durable canonical outcome
- * (see `terminalOf`). A noop (`echo`, `ls`, `cat`, ...) exits 0 without operating on
- * anything, so it is dropped here and can neither verify nor contribute to the object
- * digest.
+ * Every observed attempt at an operation entry point, in durable order — **including the ones
+ * the host reports as failed**. Collecting only usable successes and then claiming to take "the
+ * latest attempt" was a lie: a later `isError` failure carries no numeric exit code, so it never
+ * reached the collection and an earlier success survived it. The command text comes from the
+ * call, not from the outcome, so an attempt is still identifiable when its result is a failure.
+ * Noop commands and masked ones are dropped: they operate on nothing and cannot be attributed.
  */
-function opsOutcomes(ctx: ResolveAuditContext): Array<{ eventId: string; ref: string; cmd: string; exit: number; digest: string; revision: number | null }> {
-  const out: Array<{ eventId: string; ref: string; cmd: string; exit: number; digest: string; revision: number | null }> = []
+function opsAttempts(ctx: ResolveAuditContext): OpsAttempt[] {
+  const out: OpsAttempt[] = []
   const outcomes = outcomesByCallId(ctx)
+  const captured = digestsByCallId(ctx)
   for (const c of ctx.recovery.calls) {
-    if (!hostOk(c)) continue
+    if (!c.call || !c.result) continue
+    if (modelSourced(c.call) || modelSourced(c.result)) continue
+    const callData = dataOf(c.call)
+    const cmd = commandText(callData)
+    if (!cmd.trim()) continue
+    const dialect = dialectOf(callData.name)
+    if (hasMaskedExit(cmd, dialect) || !runsOpsEntry(cmd)) continue
     const t = terminalOf(outcomes.get(c.tool_call_id))
-    if (!t) continue
-    const dialect = dialectOf(dataOf(c.call).name)
-    if (hasMaskedExit(t.cmd, dialect) || !runsOpsEntry(t.cmd)) continue
-    out.push({ eventId: c.result.event_id, ref: c.result.output_ref ?? c.result.event_id, cmd: t.cmd, exit: t.exit,
-      digest: t.digest, revision: c.result.objective_revision ?? null })
+    const hostFailed = c.result.result_status === 'failed' || c.status === 'failed'
+    const outcome: OpsAttempt['outcome'] = hostFailed || (t && t.exit !== 0) ? 'failed' : t ? 'passed' : 'unknown'
+    out.push({
+      eventId: c.result.event_id, ref: c.result.output_ref ?? c.result.event_id, cmd, outcome,
+      exit: t ? t.exit : null, digest: t?.digest || captured.get(c.tool_call_id ?? '') || '',
+      revision: c.result.objective_revision ?? null,
+    })
   }
   return out
 }
@@ -725,9 +742,11 @@ function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, obj
  */
 function buildOpsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
   const ids = acceptanceIds(task)
-  const attempts = opsOutcomes(ctx)
+  const attempts = opsAttempts(ctx)
   const latest = attempts.at(-1)
-  if (!ids.length || !latest || latest.exit !== 0) return []
+  // The newest attempt decides. A later failure of the same entry point — including one the
+  // host reports as an error rather than as a non-zero exit — leaves no proof (spec §107).
+  if (!ids.length || !latest || latest.outcome !== 'passed') return []
   // An operation's object is not a file set: this digest is derived from the observed outcomes
   // themselves, so it cannot silently track a later edit the way a file digest can.
   const digest = latest.digest || objectDigest
@@ -764,8 +783,8 @@ function objectDigestFor(type: TaskType, ctx: ResolveAuditContext): string {
   const fileDigest = computeObjectDigest(ctx.records)
   if (fileDigest || type === 'code' || type === 'docs' || type === 'discussion') return fileDigest
   if (type === 'research') { const d = recordedDelivery(ctx); return d ? sha256({ object: 'research-delivery', text: d.text }) : '' }
-  const outcomes = opsOutcomes(ctx)
-  return outcomes.length ? sha256({ object: 'ops-outcomes', outcomes }) : ''
+  const attempts = opsAttempts(ctx)
+  return attempts.length ? sha256({ object: 'ops-attempts', attempts }) : ''
 }
 
 /**

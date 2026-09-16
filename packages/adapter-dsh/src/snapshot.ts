@@ -4,86 +4,124 @@ import { objectVersionDigest } from './fingerprint.js'
 /** Shell tools whose command text can name a file they wrote. */
 export const SHELL_TOOL = /^(?:pwsh|powershell|bash|sh|dash|zsh|ksh|fish|csh|tcsh|cmd)$/i
 
+/** Which shell's quoting and escaping rules apply to a command's text. */
+export type ShellDialect = 'posix' | 'powershell'
+
+/** The dialect a tool name implies; anything unrecognized is read as POSIX (the stricter one). */
+export function dialectOfTool(toolName: unknown): ShellDialect {
+  return typeof toolName === 'string' && /^(?:pwsh|powershell)$/i.test(toolName) ? 'powershell' : 'posix'
+}
+
+/**
+ * One lexical unit of a command: a word (with its value already unescaped and unquoted, and a
+ * flag saying whether quoting was involved) or an operator. Keeping the value instead of
+ * blanking quoted spans is what lets a quoted path still be recognised as a path while a `>`
+ * inside quotes stops being an operator.
+ */
+export interface ShellToken { value: string; quoted: boolean; operator: string | null }
+
+const OPERATORS = ['>>', '&&', '||', '>', '|', ';', '\n']
+
+/**
+ * Split a command into tokens using one dialect's rules. Escaping is dialect-specific: POSIX
+ * uses `\`, PowerShell uses a backtick, so `` Write-Output `> path `` prints text while
+ * `Write-Output \> path` does not. A doubled quote inside a quoted string is a literal quote
+ * in both shells.
+ */
+export function tokenizeShell(command: string, dialect: ShellDialect): ShellToken[] {
+  const escape = dialect === 'powershell' ? '`' : '\\'
+  const tokens: ShellToken[] = []
+  let value = '', quoted = false, inWord = false
+  const flush = (): void => {
+    if (!inWord) return
+    tokens.push({ value, quoted, operator: null })
+    value = ''; quoted = false; inWord = false
+  }
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if (ch === escape) {
+      const next = command[i + 1]
+      if (next !== undefined) { value += next; i++ } else value += ch
+      inWord = true
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      const quote = ch
+      quoted = true; inWord = true
+      i++
+      while (i < command.length) {
+        const inner = command[i]
+        if (inner === quote) {
+          if (command[i + 1] === quote) { value += quote; i += 2; continue }
+          break
+        }
+        if (quote === '"' && inner === escape && command[i + 1] !== undefined) { value += command[i + 1]; i += 2; continue }
+        value += inner; i++
+      }
+      continue
+    }
+    const operator = OPERATORS.find(op => command.startsWith(op, i))
+    if (operator) { flush(); tokens.push({ value: operator, quoted: false, operator }); i += operator.length - 1; continue }
+    if (ch === ' ' || ch === '\t' || ch === '\r') { flush(); continue }
+    value += ch; inWord = true
+  }
+  flush()
+  return tokens
+}
+
+/** Flags whose next token is a path, for the cmdlets that take one explicitly. */
+const PATH_FLAG = /^-(?:literal|file)?path$/i
+/** A token that looks like a path rather than an argument value. */
+const PATH_SHAPED = /[\\/]|\.[A-Za-z0-9]{1,8}$/
+
 /**
  * Paths a shell command writes to. A shell-mediated edit leaves no diff meta, so it was both
  * outside the object scope and unable to answer a docs request. Only explicit write constructs
- * count, and every candidate is later required to be a host-readable regular file, so a path a
- * command merely prints cannot become a write. A redirect operator inside a quoted string is
- * data, not syntax (`Write-Output '> /tmp/README.md'` writes nothing), while the target of a
- * real redirect may itself be quoted (`printf x > "/abs/README.md"`).
+ * count — a redirect, `tee`, `Set-Content`/`Out-File`, `sed -i` — and every candidate is later
+ * required to be a host-readable regular file, so a path a command merely prints cannot become
+ * a write. Read through the dialect's own tokenizer, so a quoted target is still a target while
+ * an escaped or quoted `>` is not an operator.
  */
-export function shellWriteTargets(command: string): string[] {
+export function shellWriteTargets(command: string, dialect: ShellDialect = 'posix'): string[] {
+  const tokens = tokenizeShell(command, dialect)
   const out = new Set<string>()
-  for (const target of redirectTargets(command)) out.add(target)
-  const unquoted = stripQuoted(command)
-  const clean = (token: string): string => token.replace(/^["']+|["']+$/g, '')
-  for (const m of unquoted.matchAll(/\b(?:tee|Set-Content|Add-Content|Out-File)\b([^\n;&|]*)/gi))
-    for (const token of m[1].trim().split(/\s+/)) {
-      const target = clean(token)
-      if (target && !target.startsWith('-')) out.add(target)
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]
+    if (token.operator === '>' || token.operator === '>>') {
+      const next = tokens[i + 1]
+      if (next && !next.operator && next.value && !/^&\d*$/.test(next.value)) out.add(next.value)
+      continue
     }
-  for (const m of unquoted.matchAll(/\bsed\b[^\n;&|]*?\s-i\S*\s+([^\n;&|]*)/gi)) {
-    const operands = m[1].trim().split(/\s+/).map(clean).filter(t => t && !t.startsWith('-'))
-    const target = operands.at(-1)
-    if (target) out.add(target)
+    if (token.operator) continue
+    const name = token.value.toLowerCase()
+    if (name === 'tee' || name === 'set-content' || name === 'add-content' || name === 'out-file') {
+      for (let j = i + 1; j < tokens.length && !tokens[j].operator; j++) {
+        const arg = tokens[j]
+        if (PATH_FLAG.test(arg.value)) {
+          const path = tokens[j + 1]
+          if (path && !path.operator && path.value) out.add(path.value)
+          j++
+          continue
+        }
+        if (arg.value.startsWith('-')) continue
+        if (PATH_SHAPED.test(arg.value)) out.add(arg.value)
+      }
+      continue
+    }
+    if (name === 'sed') {
+      let inPlace = false
+      const operands: string[] = []
+      for (let j = i + 1; j < tokens.length && !tokens[j].operator; j++) {
+        const arg = tokens[j]
+        if (/^-i/.test(arg.value)) { inPlace = true; continue }
+        if (arg.value.startsWith('-')) continue
+        operands.push(arg.value)
+      }
+      const target = operands.at(-1)
+      if (inPlace && target) out.add(target)
+    }
   }
   return [...out]
-}
-
-/**
- * Redirect targets (`>`, `>>`) of a command, read with shell quoting in mind: an operator
- * inside quotes is text, an unquoted one takes the next token, which may be quoted.
- */
-function redirectTargets(command: string): string[] {
-  const out: string[] = []
-  let quote: string | null = null
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]
-    if (quote === null && ch === '\\') { i++; continue }
-    if (quote === null && (ch === '"' || ch === "'")) { quote = ch; continue }
-    if (quote !== null) { if (ch === quote) quote = null; continue }
-    if (ch !== '>') continue
-    if (i > 0 && command[i - 1] === '&') continue        // `&>` and `2>&1` are not write targets
-    let j = i + 1
-    if (command[j] === '>') j++                          // append
-    while (command[j] === ' ' || command[j] === '\t') j++
-    if (command[j] === '&') continue                     // `>&1`
-    if (command[j] === '"' || command[j] === "'") {
-      const closing = command[j]
-      const end = command.indexOf(closing, j + 1)
-      if (end === -1) continue
-      out.push(command.slice(j + 1, end))
-      i = end
-      continue
-    }
-    const start = j
-    while (j < command.length && !/[\s;&|<>]/.test(command[j])) j++
-    out.push(command.slice(start, j))
-    i = j - 1
-  }
-  return out.map(t => t.replace(/^["']+|["']+$/g, '')).filter(t => t && !/^&\d*$/.test(t))
-}
-
-/**
- * Drop quoted spans before reading a command for shell syntax. `Write-Output '> /tmp/README.md'`
- * prints text; the `>` is data, not a redirection, and treating it as one let a printed string
- * stand in for a document write. Quote tracking follows shell rules closely enough for this
- * purpose: a backslash escapes the next character outside single quotes.
- */
-function stripQuoted(command: string): string {
-  let out = '', quote: string | null = null
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]
-    if (quote === null) {
-      if (ch === '\\') { out += '  '; i++; continue }
-      if (ch === '"' || ch === "'") { quote = ch; out += ' '; continue }
-      out += ch
-      continue
-    }
-    if (ch === quote) { quote = null; out += ' '; continue }
-    out += ' '
-  }
-  return out
 }
 
 /** Host-readable regular files among the candidates: directories and unreadable paths are not artifacts. */
@@ -130,7 +168,7 @@ export function touchedPathsOf(toolName: string, args: unknown): string[] {
         ? ['command', 'cmd', 'script', 'shell', 'code', 'commands', 'input']
           .map(k => (parsed as any)[k]).find(v => typeof v === 'string') ?? ''
         : ''
-    if (command) out.push(...shellWriteTargets(command))
+    if (command) out.push(...shellWriteTargets(command, dialectOfTool(toolName)))
   }
   return out
 }
