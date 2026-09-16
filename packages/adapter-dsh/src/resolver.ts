@@ -278,17 +278,14 @@ function digestsByCallId(ctx: ResolveAuditContext): Map<string, string> {
 }
 
 /**
- * Terminal evidence for one call: the durable canonical outcome is primary, the
- * `meta.card:'terminal'` UI shape some hosts emit is the fallback. Returns null when
- * neither carries both a numeric exit code and command text, so an unclassifiable
- * invocation stays `unknown` instead of minting an uncheckable pass.
+ * Terminal evidence for one call: the durable canonical outcome, and only that. An outcome
+ * with no captured object version is NOT evidence of anything — the legacy `meta.card` UI
+ * shape DSH never emits was the other candidate, and accepting it meant accepting a terminal
+ * fact with no version to attest, which the turn's own digest then filled in. No capture, no
+ * proof: the missing version stays unknown instead of being replaced by the current one.
  */
-function terminalOf(outcome: CallOutcome | undefined, callData: any, resultData: any): CallOutcome | null {
-  const meta = resultData?.meta
-  const fromCard = !!meta && typeof meta === 'object' && meta.card === 'terminal' && typeof meta.exitCode === 'number'
-    ? { exit: meta.exitCode as number, cmd: commandText(callData), digest: '' } : null
-  for (const s of [outcome ?? null, fromCard]) if (s && s.cmd.trim()) return s
-  return null
+function terminalOf(outcome: CallOutcome | undefined): CallOutcome | null {
+  return outcome && outcome.cmd.trim() ? outcome : null
 }
 
 /**
@@ -414,7 +411,7 @@ function buildEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDiges
     if (modelSourced(c.call) || modelSourced(c.result)) continue
     const resultData = dataOf(c.result), callData = dataOf(c.call)
     const toolName = typeof callData.name === 'string' ? callData.name : 'unknown'
-    const t = terminalOf(outcomes.get(c.tool_call_id), callData, resultData)
+    const t = terminalOf(outcomes.get(c.tool_call_id))
     const exitCode = t ? t.exit : null
     const hostFailed = c.result.result_status === 'failed' || c.status === 'failed'
     let status: Status, assertionPassed: boolean | null, requiresExitCode = false
@@ -424,16 +421,18 @@ function buildEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDiges
     const determinate = status === 'passed' || status === 'failed'
     // Relevance + anti-masking gate: only an unmasked verification-class command speaks to acceptance.
     const verifiesAcceptance = !!t && isTrustworthyVerification(t.cmd, dialectOf(callData.name))
-    // The object version this proof may speak for: the one captured when the tool ran. A
-    // legacy `meta.card` result carries no such capture; it keeps the turn's digest and is
-    // therefore only as trustworthy as the host that emitted that shape (DSH emits none).
-    const proofDigest = t?.digest || objectDigest
+    // A proof may only speak for the object version captured when the tool ran. No capture
+    // (the run predates any observed file, or the record predates this mechanism) means the
+    // proof cannot be tied to a version at all, so it claims no requirement instead of
+    // borrowing the current version and vouching for files it never saw.
+    const captured = t?.digest ?? ''
+    const attestable = !!t && !!captured
     out.push({
       event_id: `verify:${c.result.event_id}`,
       task_id: c.result.task_id ?? task.task_id,
       objective_revision: c.result.objective_revision ?? task.objective_revision,
-      requirement_ids: verifiesAcceptance && determinate ? applicableIds : [],
-      object_version_digest: proofDigest, environment_digest: envDigest,
+      requirement_ids: verifiesAcceptance && determinate && attestable ? applicableIds : [],
+      object_version_digest: captured, environment_digest: envDigest,
       status, complete: true, source_kind: 'host_verifier',
       verifier_ref: `dsh-tool:${toolName}:${c.tool_call_id}`,
       output_ref: c.result.output_ref ?? c.result.event_id,
@@ -620,10 +619,14 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
     if (shellWrote) for (const p of shellWriteTargets(command)) candidates.push(p)
     const written = candidates.filter(p => hostReadable(p) && answersDocsRequest(p, named))
     if (!written.length) continue
+    // The artifact must be attested at the version captured when the write happened; without
+    // that capture the proof cannot say which version the document was, so it is not minted.
+    const writeDigest = captured.get(c.tool_call_id ?? '') ?? ''
+    if (!writeDigest) continue
     out.push({
       event_id: `verify:${c.result.event_id}`, task_id: c.result.task_id ?? task.task_id,
       objective_revision: c.result.objective_revision ?? task.objective_revision,
-      requirement_ids: ids, object_version_digest: captured.get(c.tool_call_id ?? '') || objectDigest,
+      requirement_ids: ids, object_version_digest: writeDigest,
       environment_digest: envDigest,
       status: 'passed', complete: true, source_kind: 'host_verifier',
       verifier_ref: `dsh-host:docs-artifact:${written[0]}`, output_ref: c.result.output_ref ?? c.result.event_id,
@@ -670,7 +673,7 @@ function opsOutcomes(ctx: ResolveAuditContext): Array<{ eventId: string; ref: st
   const outcomes = outcomesByCallId(ctx)
   for (const c of ctx.recovery.calls) {
     if (!hostOk(c)) continue
-    const t = terminalOf(outcomes.get(c.tool_call_id), dataOf(c.call), dataOf(c.result))
+    const t = terminalOf(outcomes.get(c.tool_call_id))
     if (!t) continue
     const dialect = dialectOf(dataOf(c.call).name)
     if (hasMaskedExit(t.cmd, dialect) || !runsOpsEntry(t.cmd)) continue
@@ -697,6 +700,8 @@ function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, obj
   const delivery = recordedDelivery(ctx)
   const query = lastExternalQuery(ctx)
   if (!ids.length || !delivery || !query) return []
+  // Research's object is the delivered content, not a file set: the digest is derived from the
+  // delivery event itself and does not move with the working tree.
   const digest = query.digest || objectDigest
   if (!digest) return []
   return [{
@@ -723,6 +728,8 @@ function buildOpsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDi
   const attempts = opsOutcomes(ctx)
   const latest = attempts.at(-1)
   if (!ids.length || !latest || latest.exit !== 0) return []
+  // An operation's object is not a file set: this digest is derived from the observed outcomes
+  // themselves, so it cannot silently track a later edit the way a file digest can.
   const digest = latest.digest || objectDigest
   if (!digest) return []
   return [{

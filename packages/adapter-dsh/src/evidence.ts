@@ -54,9 +54,11 @@ export class EvidenceLedger {
   /** session_id -> its records in append order, so every per-session query is O(session)
    * instead of O(ledger). The ledger grows forever; the queries must not. */
   private bySession = new Map<string, EvidenceRecord[]>()
-  /** session_id -> [start, end) byte range of its lines on disk. Lets `recover` re-read the
-   * durable bytes that belong to one session instead of constructing a whole second ledger. */
-  private ranges = new Map<string, { start: number; end: number }>()
+  /** session_id -> the extents (contiguous byte runs) of its lines on disk. A single
+   * `[first, last]` interval degenerates to the whole file as soon as two sessions interleave,
+   * which is the normal case when more than one session is open; a list of runs keeps the read
+   * proportional to what the session actually wrote. */
+  private ranges = new Map<string, Array<{ start: number; end: number }>>()
   /** Byte offset of events.ndjson already loaded into memory; appends read only past it. */
   private offset = 0
   constructor(root?: string) {
@@ -89,8 +91,12 @@ export class EvidenceLedger {
     const list = this.bySession.get(sessionId)
     if (list) list.push(record); else this.bySession.set(sessionId, [record])
     if (byteStart === undefined || byteEnd === undefined) return
-    const range = this.ranges.get(sessionId)
-    if (range) range.end = byteEnd; else this.ranges.set(sessionId, { start: byteStart, end: byteEnd })
+    const extents = this.ranges.get(sessionId)
+    const last = extents?.at(-1)
+    // Contiguous with the session's previous line -> extend; otherwise this is a new run.
+    if (extents && last && last.end === byteStart) last.end = byteEnd
+    else if (extents) extents.push({ start: byteStart, end: byteEnd })
+    else this.ranges.set(sessionId, [{ start: byteStart, end: byteEnd }])
   }
   record(sessionId: string, type: string, payload: unknown, link: Association = {}): EvidenceRecord {
     return this.withLock(() => {
@@ -191,14 +197,18 @@ export class EvidenceLedger {
   private sessionBytes(sessionId: string): Buffer | null {
     const file = join(this.root, 'events.ndjson')
     if (!existsSync(file)) return null
-    this.readTail() // fold in bytes another writer appended, so the range is current
+    this.readTail() // fold in bytes another writer appended, so the extents are current
     const size = statSync(file).size
     if (size === 0) return null
-    const range = this.ranges.get(sessionId)
-    if (!range) return this.readTailBytes(file, 0, size)
-    const start = Math.max(0, Math.min(range.start, size))
-    const end = Math.max(start, Math.min(range.end, size))
-    return this.readTailBytes(file, start, end - start)
+    const extents = this.ranges.get(sessionId)
+    if (!extents || !extents.length) return this.readTailBytes(file, 0, size)
+    const chunks: Buffer[] = []
+    for (const extent of extents) {
+      const start = Math.max(0, Math.min(extent.start, size))
+      const end = Math.max(start, Math.min(extent.end, size))
+      if (end > start) chunks.push(this.readTailBytes(file, start, end - start))
+    }
+    return chunks.length ? Buffer.concat(chunks) : null
   }
   /**
    * Re-open the durable log for one session, never reconstruct authority or proof from a

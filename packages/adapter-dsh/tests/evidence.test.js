@@ -199,3 +199,26 @@ test('recover folds in records another instance appended after construction', t 
   B.record('brand-new', 'from-b', { n: 1 })
   assert.equal(A.recover('brand-new').records.length, 1, 'a session A never wrote must still recover')
 })
+
+// ⑩ F8 (independent review): one [first, last] interval per session covers every other
+// session's bytes in between, so a two-record session read the entire ledger — the read was
+// not bounded by the session's own data. Per-session extents keep it proportional.
+test('recover reads only the session\'s own extents when sessions interleave', t => {
+  const root = fixture(t), file = join(root, 'events.ndjson')
+  const A = new EvidenceLedger(root)
+  A.record('a', 'seed', { i: 1 })
+  const B = new EvidenceLedger(root)
+  for (let i = 0; i < 100; i++) B.record('b', 'seed', { i })
+  A.record('a', 'seed', { i: 2 })
+  const fullSize = statSync(file).size
+  assert.ok(fullSize > 10000, `fixture should be large, got ${fullSize}`)
+
+  let bytes = 0
+  const orig = A.readTailBytes.bind(A)
+  A.readTailBytes = (f, pos, len) => { bytes += len; return orig(f, pos, len) }
+  const view = A.recover('a')
+
+  assert.deepEqual(view.records.map(r => r.payload.i), [1, 2])
+  assert.ok(bytes > 0, 'recover must still read from disk')
+  assert.ok(bytes * 5 < fullSize, `recover read ${bytes}B of a ${fullSize}B ledger; interleaving must not widen the read`)
+})

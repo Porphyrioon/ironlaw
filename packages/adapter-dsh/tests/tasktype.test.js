@@ -10,23 +10,35 @@ import { apply } from '@ironlaw/adapter-dsh'
 const fixture = t => { const root = mkdtempSync(join(tmpdir(), 'ironlaw-tt-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root }
 function host(root, resolveAudit) {
   const handlers = new Map(), prompts = []
+  const session = { id: 'session' }
   apply({ on(name, fn) { handlers.set(name, fn) }, tools: { guard() {} } }, { evidenceRoot: root, resolveAudit })
   return { handlers, prompts,
-    emit(type, data, seq) { handlers.get('session/event')({ id: 'session' }, { type, data, seq }) },
-    stop(turn = 1) { handlers.get('agent/turn-stopping')({ agent: { session: { id: 'session' }, steer: m => prompts.push(m) }, turn }) } }
+    emit(type, data, seq) { handlers.get('session/event')(session, { type, data, seq }) },
+    stop(turn = 1) { handlers.get('agent/turn-stopping')({ agent: { session, steer: m => prompts.push(m) }, turn }) },
+    /** The host hook: exit code and captured object version exist only here (see hostshape.test.js). */
+    toolResultHook(callId, name, args, value) {
+      handlers.get('tools/result')(
+        { callId, rootCallId: callId, name, arguments: args, agent: { session }, signal: new AbortController().signal, token: Symbol('exec') },
+        { isError: false, value, content: [] })
+    } }
 }
+const canonical = exitCode => ({ kind: 'foreground', exitCode, signal: null, timedOut: false, aborted: false,
+  timeoutMs: 0, stdout: { text: 'ok', truncated: false }, stderr: { text: '', truncated: false } })
 const toolResult = (callId, patch = {}) => ({ turn: 1, message: { source: { kind: 'tool', callId }, content: [{ type: 'tool-result', toolCallId: callId, isError: false, content: [] }] }, ...patch })
 const decision = root => new EvidenceLedger(root).latest('session', 'completion.decision')
 const taskType = root => new EvidenceLedger(root).latest('session', 'task.classification')?.task_type
 const user = (h, text, seq = 1) => h.emit('user/message', { source: { kind: 'user' }, content: [{ type: 'text', text }] }, seq)
 const assistant = (h, text, seq) => h.emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text }] } }, seq)
 const edit = (h, callId, path, cSeq, rSeq, oldText = null, newText = 'new\n') => {
-  h.emit('tool/call', { turn: 1, callId, name: 'edit', arguments: JSON.stringify({ file_path: path }) }, cSeq)
+  const args = { file_path: path }
+  h.emit('tool/call', { turn: 1, callId, name: 'edit', arguments: JSON.stringify(args) }, cSeq)
+  h.toolResultHook(callId, 'edit', args, { ok: true })
   h.emit('tool/result', toolResult(callId, { meta: { card: 'diff', diffs: [{ path, oldText, newText }] } }), rSeq)
 }
 const shell = (h, callId, command, exitCode, cSeq, rSeq) => {
   h.emit('tool/call', { turn: 1, callId, name: 'bash', arguments: JSON.stringify({ command }) }, cSeq)
-  h.emit('tool/result', toolResult(callId, { meta: { card: 'terminal', exitCode, output: 'ok' } }), rSeq)
+  h.toolResultHook(callId, 'bash', { command }, canonical(exitCode))
+  h.emit('tool/result', toolResult(callId), rSeq)
 }
 
 // ① The reported false positive: a README change with no test command must NOT be evidence_missing.

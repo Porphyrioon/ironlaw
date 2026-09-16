@@ -52,6 +52,7 @@ const sessResult = callId => ({ turn: 1, message: { source: { kind: 'tool', call
 const edit = (h, callId, path, cSeq, rSeq) => {
   const args = { file_path: path, old_string: 'a', new_string: 'b' }
   h.emit('tool/call', { turn: 1, callId, name: 'edit', arguments: JSON.stringify(args) }, cSeq)
+  h.toolResultHook(callId, 'edit', args, { ok: true }) // the capture a docs/write proof needs
   // Real edit meta is a bare diffs array with no `card` discriminator.
   h.emit('tool/result', { ...sessResult(callId), meta: { diffs: [{ path, oldText: 'a', newText: 'b' }] } }, rSeq)
 }
@@ -222,9 +223,9 @@ test('F fail closed: a canonical value without a numeric exitCode verifies nothi
   h.emit('tool/result', sessResult('v1'), 5)
   assistant(h, '已修复并通过测试。', 6)
   h.stop(1)
-  const recs = outcomeRecords(root)
-  assert.equal(recs.length, 1)
-  assert.equal(recs[0].exit_code, null)
+  const mine = outcomeRecords(root).filter(r => r.tool_call_id === 'v1')
+  assert.equal(mine.length, 1, 'the command itself is recorded')
+  assert.equal(mine[0].exit_code, null, 'a canonical value without an exit code records none')
   assert.notEqual(decision(root).verdict, 'verified_complete')
 })
 test('F fail closed: an exit code with no command text verifies nothing', t => {
@@ -248,15 +249,57 @@ test('F fail closed: no hook at all and no meta leaves a code task unverified', 
   h.emit('tool/result', sessResult('v1'), 5)
   assistant(h, '已修复并通过测试。', 6)
   h.stop(1)
-  assert.equal(outcomeRecords(root).length, 0)
+  assert.equal(outcomeRecords(root).filter(r => r.tool_call_id === 'v1').length, 0,
+    'a call the hook never saw has no outcome, whatever else the session recorded')
   const d = decision(root)
   assert.notEqual(d.verdict, 'verified_complete')
   assert.ok(d.missing_requirements.some(m => m.requirement_id === 'AC-1' && m.missing_reason === 'evidence_missing'))
 })
 
+// R1 (second independent review): a run captured before any file was observed has no version to
+// attest. Filling in the current version afterwards let that run vouch for a file it never saw.
+test('R1 a run captured before any file was observed cannot vouch for a later file', t => {
+  const root = fixture(t), code = join(root, 'login.js')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  shell(h, 'v1', 'npm test', 0, 2, 3) // nothing observed yet: the capture is empty
+  const captured = outcomeRecords(root).find(r => r.tool_call_id === 'v1')
+  assert.equal(captured.object_version_digest ?? captured.payload.object_version_digest, '',
+    'the fixture must actually capture nothing')
+
+  writeFileSync(code, 'b\n')
+  edit(h, 'e1', code, 4, 5) // the file appears only now, and the test is not re-run
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete',
+    'a versionless run must not be filled in with the current version')
+})
+
+// R2: the touched scope is host state, so a remount has to recover it from the ledger, or a
+// verification running afterwards captures nothing at all.
+test('R2 a remounted plugin recovers the scope, and still invalidates after a change', t => {
+  const root = fixture(t), file = join(root, 'login.js')
+  writeFileSync(file, 'b\n')
+  const first = host(root)
+  user(first, '修复登录的 bug 并验证')
+  edit(first, 'e1', file, 2, 3)
+  assistant(first, '先改一处。', 4)
+  first.stop(1) // no verification yet
+
+  const second = host(root) // a remount on the same ledger
+  shell(second, 'v2', 'npm test', 0, 5, 6)
+  assistant(second, '已修复并验证。', 7)
+  second.stop(2)
+  assert.equal(decision(root).verdict, 'verified_complete', 'the remount must recover the object scope')
+
+  writeFileSync(file, 'throw new Error("broken")\n')
+  assistant(second, '又改了一点。', 8)
+  second.stop(3)
+  assert.notEqual(decision(root).verdict, 'verified_complete', 'a recovered scope must still invalidate')
+})
+
 // The non-shell templates keep working on the real shapes.
-test('G docs: a real edit with card-free diffs meta still verifies', t => {
-  const root = fixture(t), readme = join(root, 'README.md'); writeFileSync(readme, '# Title\n')
+test('G docs: a real edit with card-free diffs meta still verifies', t => {  const root = fixture(t), readme = join(root, 'README.md'); writeFileSync(readme, '# Title\n')
   const h = host(root)
   user(h, '更新 README 文档，补充安装说明')
   edit(h, 'w1', readme, 2, 3)

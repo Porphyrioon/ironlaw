@@ -104,12 +104,30 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
    * invalidation the digest comparison exists to provide.
    */
   const touched = new Map<string, Set<string>>()
+  /**
+   * The session's touched paths, restored from its durable records the first time it is asked
+   * for. Without this a plugin remount (reload, restart) starts with an empty scope, so a
+   * verification running afterwards captures no object version at all and the proof that should
+   * attest it cannot be tied to the files it verified.
+   */
+  const touchedFor = (sessionId: string): Set<string> => {
+    const known = touched.get(sessionId)
+    if (known) return known
+    const restored = new Set<string>()
+    for (const record of ledger.snapshot(sessionId)) {
+      if (record.type !== 'tool.call') continue
+      const data = (record.payload as any)?.data
+      if (!data) continue
+      for (const path of touchedPathsOf(typeof data.name === 'string' ? data.name : '', data.arguments)) restored.add(path)
+    }
+    touched.set(sessionId, restored)
+    return restored
+  }
   const rememberTouched = (sessionId: string, toolName: string, args: unknown): void => {
     const paths = touchedPathsOf(toolName, args)
     if (!paths.length) return
-    const set = touched.get(sessionId) ?? new Set<string>()
+    const set = touchedFor(sessionId)
     for (const path of paths) set.add(path)
-    touched.set(sessionId, set)
   }
   const taskFor = (sessionId: string): TaskContract => declared(ledger.task(sessionId) ?? {
     schema_version: 2, task_id: `unresolved:${sessionId}`, objective_revision: 1,
@@ -138,7 +156,7 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     const exitCode = canonicalExitCode(result.isError ? undefined : result.value)
     const command = canonicalCommand(exec.arguments)
     const callId = typeof exec.callId === 'string' ? exec.callId : ''
-    const objectDigest = snapshotObjectVersion(touched.get(sessionId) ?? [])
+    const objectDigest = snapshotObjectVersion(touchedFor(sessionId))
     if (!callId || (exitCode === null && !command && !objectDigest)) return
     const outcome = { tool_call_id: callId, name: exec.name, command, exit_code: exitCode, is_error: result.isError, object_version_digest: objectDigest }
     const outcomeLink = { tool_call_id: callId, exit_code: exitCode }

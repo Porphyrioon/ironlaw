@@ -12,11 +12,25 @@ const fixture = t => { const root = mkdtempSync(join(tmpdir(), 'ironlaw-resolver
 // host(root) with no resolver -> the adapter falls back to defaultResolveAudit (the unit under test).
 function host(root, resolveAudit) {
   const handlers = new Map(), prompts = []
+  const session = { id: 'session' }
   apply({ on(name, fn) { handlers.set(name, fn) }, tools: { guard() {} } }, { evidenceRoot: root, resolveAudit })
   return { handlers, prompts,
-    emit(type, data, seq) { handlers.get('session/event')({ id: 'session' }, { type, data, seq }) },
-    stop(turn = 1) { handlers.get('agent/turn-stopping')({ agent: { session: { id: 'session' }, steer: m => prompts.push(m) }, turn }) } }
+    emit(type, data, seq) { handlers.get('session/event')(session, { type, data, seq }) },
+    stop(turn = 1) { handlers.get('agent/turn-stopping')({ agent: { session, steer: m => prompts.push(m) }, turn }) },
+    /**
+     * Fire the registry hook with a canonical result value, as DSH does. The exit code and the
+     * captured object version exist only here: the session event stream carries neither, so a
+     * fixture that invents a `meta.card:'terminal'` is testing a shape no host produces.
+     */
+    toolResultHook(callId, name, args, value) {
+      handlers.get('tools/result')(
+        { callId, rootCallId: callId, name, arguments: args, agent: { session }, signal: new AbortController().signal, token: Symbol('exec') },
+        { isError: false, value, content: [] })
+    } }
 }
+/** A shell tool's canonical value: what the host records when a command finishes. */
+const canonical = exitCode => ({ kind: 'foreground', exitCode, signal: null, timedOut: false, aborted: false,
+  timeoutMs: 0, stdout: { text: exitCode === 0 ? 'ok' : 'FAIL', truncated: false }, stderr: { text: '', truncated: false } })
 const toolResult = (callId, patch = {}) => ({ turn: 1, message: { source: { kind: 'tool', callId }, content: [{ type: 'tool-result', toolCallId: callId, isError: false, content: [] }] }, ...patch })
 const decision = root => new EvidenceLedger(root).latest('session', 'completion.decision')
 
@@ -29,7 +43,8 @@ test('resolver ① host-verified passing test run yields verified_complete', t =
   h.emit('tool/result', toolResult('edit-1', { meta: { card: 'diff', diffs: [{ path: code, oldText: null, newText: 'module.exports = 2\n' }] } }), 3)
   // The acceptance proof: a terminal test run that exited 0.
   h.emit('tool/call', { turn: 1, callId: 'test-1', name: 'bash', arguments: JSON.stringify({ command: 'npm test' }) }, 4)
-  h.emit('tool/result', toolResult('test-1', { meta: { card: 'terminal', exitCode: 0, output: 'PASS' } }), 5)
+  h.toolResultHook('test-1', 'bash', { command: 'npm test' }, canonical(0))
+  h.emit('tool/result', toolResult('test-1'), 5)
   h.emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'Done; tests pass.' }] } }, 6)
   h.stop(1)
   const ledger = new EvidenceLedger(root), d = decision(root)
@@ -62,7 +77,8 @@ test('resolver ③ failing test run yields verification_failed', t => {
   h.emit('tool/result', toolResult('edit-1', { meta: { card: 'diff', diffs: [{ path: code, oldText: null, newText: 'y' }] } }), 3)
   // The command ran fine (isError false) but exited non-zero -> a real test failure.
   h.emit('tool/call', { turn: 1, callId: 'test-1', name: 'bash', arguments: JSON.stringify({ command: 'npm test' }) }, 4)
-  h.emit('tool/result', toolResult('test-1', { meta: { card: 'terminal', exitCode: 1, output: 'FAIL' } }), 5)
+  h.toolResultHook('test-1', 'bash', { command: 'npm test' }, canonical(1))
+  h.emit('tool/result', toolResult('test-1'), 5)
   h.emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'All good!' }] } }, 6)
   h.stop(1)
   const d = decision(root)
@@ -119,7 +135,8 @@ function editThenCommand(t, cmd, exitCode = 0) {
   h.emit('tool/call', { turn: 1, callId: 'edit-1', name: 'edit', arguments: JSON.stringify({ file_path: code }) }, 2)
   h.emit('tool/result', toolResult('edit-1', { meta: { card: 'diff', diffs: [{ path: code, oldText: null, newText: 'module.exports=2\n' }] } }), 3)
   h.emit('tool/call', { turn: 1, callId: 'v-1', name: 'bash', arguments: JSON.stringify({ command: cmd }) }, 4)
-  h.emit('tool/result', toolResult('v-1', { meta: { card: 'terminal', exitCode, output: 'ok' } }), 5)
+  h.toolResultHook('v-1', 'bash', { command: cmd }, canonical(exitCode))
+  h.emit('tool/result', toolResult('v-1'), 5)
   h.emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text: '已修复并验证。' }] } }, 6)
   h.stop(1)
   return decision(root)
