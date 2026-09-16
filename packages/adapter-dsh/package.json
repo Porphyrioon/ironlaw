@@ -15,7 +15,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib",
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -28,7 +29,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test tests/*.test.js"
+    "test": "npm run build && node --test tests/*.test.js",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=22"
