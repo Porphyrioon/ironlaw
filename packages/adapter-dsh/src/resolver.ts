@@ -977,8 +977,11 @@ function buildOpsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDi
   const latest = attempts.at(-1)
   if (!latest) return []
   // An operation's object is not a file set: this digest is derived from the observed outcomes
-  // themselves, so it cannot silently track a later edit the way a file digest can.
-  const digest = latest.digest || objectDigest
+  // themselves, so it cannot silently track a later edit the way a file digest can, and it is the
+  // same value the audit compares proofs against. Preferring the attempt's own file capture (which
+  // a live session has as soon as it has touched a file) made the audit report `evidence_stale` for
+  // a correct deploy — the same defect the research template had.
+  const digest = objectDigest
   if (!digest) return []
   return [{
     event_id: `verify:${latest.eventId}`, task_id: task.task_id,
@@ -1148,6 +1151,15 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
   } else {
     evidence = buildEvidence(ctx, confirmed, objectDigest, envDigest)
   }
+
+  // The audit compares every proof's object digest with the input's, and reports `evidence_stale`
+  // when they differ — so a proof may only ever carry THIS run's domain digest. The templates above
+  // each know their own object, and two of them used to prefer a per-call value (a file capture
+  // recorded when the call ran); any session that had touched a file then produced a correct proof
+  // the audit could never accept. Stamping here makes the invariant hold by construction instead of
+  // relying on every template to remember it.
+  evidence = evidence.map(proof => proof.object_version_digest === objectDigest
+    ? proof : { ...proof, object_version_digest: objectDigest })
 
   // Version the proof ids before anything can reference them (decision.evidence_refs, a
   // blocker's evidence_ref): an id is only ever written once, under one object version.

@@ -44,6 +44,19 @@ const decision = root => ledger(root).latest('session', 'completion.decision')
 const taskType = root => ledger(root).latest('session', 'task.classification')?.task_type
 const outcomeRecords = root => ledger(root).snapshot('session').filter(r => r.type === 'tool.outcome')
 const proofs = root => { const l = ledger(root); return l.verifications('session', l.task('session').task_id).filter(v => v.status === 'passed') }
+/**
+ * Every proof must carry the digest the audit compares against; a template that fills in something
+ * else (a call's own file capture, say) produces a proof the audit can only call stale.
+ */
+const assertDigestMatchesRun = root => {
+  const l = ledger(root), task = l.task('session')
+  const run = l.auditState('session', task.task_id)?.object_version_digest
+  const all = l.verifications('session', task.task_id)
+  assert.ok(all.length > 0, 'the fixture must have produced a proof')
+  for (const proof of all)
+    assert.equal(proof.object_version_digest, run,
+      `proof ${proof.verifier_ref} attests ${proof.object_version_digest}, the run is ${run}`)
+}
 
 const user = (h, text, seq = 1) => h.emit('user/message', { source: { kind: 'user' }, content: [{ type: 'text', text }] }, seq)
 const assistant = (h, text, seq) => h.emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text }] } }, seq)
@@ -569,6 +582,24 @@ test('R8 research verifies when the search call carries a file capture of its ow
   const d = decision(root)
   assert.equal(d.verdict, 'verified_complete',
     `the delivery is the object, not the search's file capture: ${JSON.stringify({ reasons: d.reason_codes, missing: d.missing_requirements })}`)
+  assertDigestMatchesRun(root)
+})
+
+// The same defect lived in the ops template: an operation whose call carried a file capture could
+// never close, because the proof attested that capture instead of the operation.
+test('R8 an operation verifies when the entry point call carries a file capture', t => {
+  const root = fixture(t)
+  writeFileSync(join(root, 'config.json'), 'a: 1\n')
+  const h = host(root)
+  user(h, '部署服务 A')
+  edit(h, 'e1', join(root, 'config.json'), 2, 3)
+  shell(h, 'd1', './deploy.sh prod', 0, 4, 5)
+  assistant(h, '已部署。', 6)
+  h.stop(1)
+  const d = decision(root)
+  assert.equal(d.verdict, 'verified_complete',
+    `the operation is the object, not the call's file capture: ${JSON.stringify({ reasons: d.reason_codes, missing: d.missing_requirements })}`)
+  assertDigestMatchesRun(root)
 })
 
 // T3 (third review): three ways of dropping an attempt each let an earlier success stand for
