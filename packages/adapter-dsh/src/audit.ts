@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-export const POLICY_VERSION = 'ironlaw/2.0-p1'
+export const POLICY_VERSION = 'ironlaw/2.0-p2'
 export const MAX_REPAIRS = 2
 export type Status = 'pending' | 'passed' | 'failed' | 'unknown' | 'stale'
 export type Verdict = 'allow_response' | 'verified_complete' | 'repair_required' | 'incomplete' | 'blocked' | 'cancelled'
@@ -72,6 +72,10 @@ export interface AuditInput {
   /** Independent host check against actual response text. Unknown fails closed. */
   candidate_check: { status: 'consistent' | 'contradictory' | 'unknown'; source_ref: string }
   evidence: Verification[]; hard_constraints_checked: HardConstraintCheck[]
+  /** Requirement-level gaps the trusted resolver established before the proof lookup — a citation
+   * the host never observed, for instance. A declared gap is reported as that requirement's
+   * missing reason, so the refusal names the real cause instead of the generic fallback. */
+  evidence_gaps?: Array<{ requirement_id: string; reason: string }>
   object_version_digest: string; context_state_digest: string; environment_digest: string; now: number
   cancellation?: { source_kind: 'user_instruction'; source_ref: string }
   blocker?: { evidence_ref: string; no_feasible_workaround: boolean; recovery_condition: string }
@@ -130,6 +134,8 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
   // constraint made completion impossible.
   for (const r of requirements.filter(r => r.class === 'acceptance' && !excluded(r))) {
     if (r.applicability !== 'applicable') { add(r.requirement_id, 'applicability_unknown'); continue }
+    const declared = input.evidence_gaps?.find(g => g.requirement_id === r.requirement_id)
+    if (declared) { add(r.requirement_id, declared.reason); continue }
     const e = input.evidence.filter(e => e.task_id === task.task_id && e.objective_revision === task.objective_revision
       && e.requirement_ids.includes(r.requirement_id) && e.source_kind === 'host_verifier').at(-1)
     if (!e) {
@@ -218,6 +224,7 @@ function guidance(missing: Array<{ missing_reason: string }>): string {
     evidence_stale: 'The verification\'s object version no longer matches the current files, so it cannot speak for them. Re-run the verification after your last change, then report.',
     verification_failed: 'The verification run failed. Fix the failure, re-run it, then report.',
     evidence_unknown: 'The verification outcome is indeterminate (no exit code, no assertion result). Re-run it so the host records a determinate outcome.',
+    citation_unobserved: 'The delivery cites a source the host never observed, or cites none although the session consulted sources. Cite only URLs the host actually recorded (the ones your searches and fetches returned), the way the source was reached, then report.',
   }
   const lines = [...new Set(missing.map(m => byReason[m.missing_reason]).filter((line): line is string => !!line))]
   return lines.length ? lines.join(' ') : 'Supply current requirement-linked evidence or honestly report the remaining gap.'

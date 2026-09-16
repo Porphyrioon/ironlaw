@@ -166,7 +166,7 @@ export class EvidenceLedger {
       task_id: null, objective_revision: null, requirement_ids: [], turn_id: null,
       tool_call_id: null, source_kind: 'host_event', operation: type, object_ids: [],
       object_version_digest: null, result_status: 'unknown', exit_code: null, output_ref: null,
-      started_at: null, ended_at: null, collector_version: 'ironlaw/2.0-p1',
+      started_at: null, ended_at: null, collector_version: 'ironlaw/2.0-p2',
       ...link, type, payload: safeJson(payload), occurred_at: new Date().toISOString(),
     }
     const line = `${JSON.stringify(record)}\n`

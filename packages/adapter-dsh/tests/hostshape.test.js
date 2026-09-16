@@ -77,6 +77,15 @@ const named = (h, callId, name, args, cSeq, rSeq) => {
   h.toolResultHook(callId, name, args, { ok: true })
   h.emit('tool/result', sessResult(callId), rSeq)
 }
+/** A search whose durable result carries text — the shape a citation is checked against. */
+const searched = (h, callId, query, resultText, cSeq, rSeq) => {
+  const args = { query }
+  h.emit('tool/call', { turn: 1, callId, name: 'web_search', arguments: JSON.stringify(args) }, cSeq)
+  h.toolResultHook(callId, 'web_search', args, { ok: true })
+  h.emit('tool/result', { turn: 1, message: { source: { kind: 'tool', callId },
+    content: [{ type: 'tool-result', toolCallId: callId, isError: false,
+      content: [{ type: 'text', text: resultText }] }] } }, rSeq)
+}
 
 // The hook is the fix: without a tool.outcome record the resolver has no exit code.
 test('H1 the tools/result hook persists a canonical outcome keyed by call id', t => {
@@ -785,10 +794,39 @@ test('G docs: a real edit with card-free diffs meta still verifies', t => {  con
 test('G research: a real web_search call still verifies', t => {
   const root = fixture(t), h = host(root)
   user(h, '调研一下市面上的方案')
+  // A search whose result carries the source, and a delivery that cites it: §56 evidence.
+  searched(h, 's1', 'options', '1. https://example.com/options — comparison', 2, 3)
+  assistant(h, '结论：方案 A 更合适，见 https://example.com/options。', 4)
+  h.stop(1)
+  assert.equal(taskType(root), 'research')
+  assert.equal(decision(root).verdict, 'verified_complete')
+})
+test('R6 research: a citation the host never observed is refused', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '调研一下市面上的方案')
+  searched(h, 's1', 'options', '1. https://example.com/options — comparison', 2, 3)
+  assistant(h, '结论：方案 A 更合适，见 https://invented.example/study。', 4)
+  h.stop(1)
+  const d = decision(root)
+  assert.notEqual(d.verdict, 'verified_complete', 'an unobserved citation must not close a research task')
+  assert.deepEqual(d.reason_codes, ['citation_unobserved'], JSON.stringify(d.missing_requirements))
+})
+test('R6 research: consulting sources without citing one is refused', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '调研一下市面上的方案')
+  searched(h, 's1', 'options', '1. https://example.com/options — comparison', 2, 3)
+  assistant(h, '结论：方案 A 更合适。', 4)
+  h.stop(1)
+  assert.deepEqual(decision(root).reason_codes, ['citation_unobserved'])
+})
+test('R6 research: a source the host observed nowhere leaves the citation rule silent', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '调研一下市面上的方案')
+  // The tool result carries no URL: the host has nothing to check a citation against, and it
+  // must not demand one, or the requirement could never be satisfied.
   named(h, 's1', 'web_search', { query: 'options' }, 2, 3)
   assistant(h, '结论：方案 A 更合适。', 4)
   h.stop(1)
-  assert.equal(taskType(root), 'research')
   assert.equal(decision(root).verdict, 'verified_complete')
 })
 test('G discussion: a pure question is still allow_response', t => {

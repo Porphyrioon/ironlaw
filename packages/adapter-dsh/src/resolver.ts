@@ -26,7 +26,7 @@ export interface ResolveAuditContext {
   recovery: ReturnType<EvidenceLedger['recover']>
 }
 
-const COLLECTOR_VERSION = 'ironlaw/2.0-p1'
+const COLLECTOR_VERSION = 'ironlaw/2.0-p2'
 const sha256 = (v: unknown): string => `sha256:${createHash('sha256').update(JSON.stringify(v)).digest('hex')}`
 const dataOf = (r: EvidenceRecord | undefined): any => (r?.payload as any)?.data ?? {}
 
@@ -834,6 +834,94 @@ function answersItem(path: string, item: Requirement, named: NamedTarget[]): boo
   return namedTargets(scope.join(' ')).some(target => answersTarget(normalized, target))
 }
 
+/** A URL as it appears in a delivery, a query or a search result. */
+const URL_IN_TEXT = /https?:\/\/[^\s<>"'`）)】\]]+|\bwww\.[^\s<>"'`）)】\]]+/gi
+
+/**
+ * A source reduced to what identifies it: scheme-less, lowercase, without a trailing slash,
+ * query or fragment. `https://Example.com/a/` and `https://example.com/a?utm=1` are the same
+ * source; `https://example.com/other` is not.
+ */
+function normalizeSource(url: string): string {
+  return url.trim().replace(/^https?:\/\//i, '').replace(/^www\./i, '')
+    // Trailing sentence punctuation is not part of the source: Chinese prose ends a URL with
+    // 「。」 the same way English ends it with `.`, and keeping it made every citation in a
+    // Chinese delivery look like a different (invented) source.
+    .replace(/[.,;:。，；：、)）】\]]+$/, '')
+    .split(/[?#]/)[0].replace(/\/+$/, '').toLowerCase()
+}
+
+/** Every URL inside an arbitrary record payload, without assuming where the host put it. */
+function urlsIn(value: unknown, out: Set<string>): void {
+  if (typeof value === 'string') {
+    for (const m of value.matchAll(URL_IN_TEXT)) out.add(normalizeSource(m[0]))
+    return
+  }
+  if (Array.isArray(value)) { for (const v of value) urlsIn(v, out); return }
+  if (value && typeof value === 'object') for (const v of Object.values(value)) urlsIn(v, out)
+}
+
+/** The call a durable record belongs to, from whichever field shape the host used. */
+function recordCallId(data: any): string {
+  if (typeof data?.callId === 'string') return data.callId
+  if (typeof data?.message?.source?.callId === 'string') return data.message.source.callId
+  const block = data?.message?.content?.find?.((p: any) => p?.type === 'tool-result')
+  return typeof block?.toolCallId === 'string' ? block.toolCallId : ''
+}
+
+/**
+ * The sources the host actually observed: every URL that appears in an external-source tool's
+ * arguments or result. This is what a delivery's citations are checked against — the host cannot
+ * judge whether a conclusion follows from a source, but it can tell a source the session really
+ * reached from one that was invented.
+ */
+function observedSources(ctx: ResolveAuditContext): Set<string> {
+  const out = new Set<string>()
+  const externalCalls = new Set<string>()
+  for (const r of ctx.records) {
+    if (r.type !== 'tool.call') continue
+    const data = dataOf(r)
+    if (typeof data?.name !== 'string' || !EXTERNAL_SOURCE_TOOL.test(data.name)) continue
+    const id = recordCallId(data)
+    if (id) externalCalls.add(id)
+    urlsIn(r.payload, out)
+  }
+  for (const r of ctx.records) {
+    if (r.type !== 'tool.result') continue
+    if (!externalCalls.has(recordCallId(dataOf(r)))) continue
+    urlsIn(r.payload, out)
+  }
+  out.delete('')
+  return out
+}
+
+/** The sources a delivery cites, normalized the same way as the observed ones. */
+function citedSources(text: string): string[] {
+  const out = new Set<string>()
+  for (const m of text.matchAll(URL_IN_TEXT)) out.add(normalizeSource(m[0]))
+  out.delete('')
+  return [...out]
+}
+
+/**
+ * The citation gap for a research delivery, if any. Spec §56 asks research evidence for the
+ * sources supporting its conclusions; a host-side gate cannot judge support, but it can refuse a
+ * citation to a source the session never reached, and it can ask a delivery that consulted
+ * sources to name at least one. Requiring a citation when the host observed no source at all
+ * would be a requirement nothing could satisfy, so that case leaves the rule silent.
+ */
+function researchCitationGaps(ctx: ResolveAuditContext, task: TaskContract): Array<{ requirement_id: string; reason: string }> {
+  const query = lastExternalQuery(ctx)
+  const delivery = deliveryForQuery(ctx, query)
+  if (!query || !delivery) return []
+  const observed = observedSources(ctx)
+  const cited = citedSources(delivery.text)
+  const invented = cited.filter(source => !observed.has(source))
+  const uncited = observed.size > 0 && cited.length === 0
+  if (!invented.length && !uncited) return []
+  return acceptanceItems(task).map(item => ({ requirement_id: item.requirement_id, reason: 'citation_unobserved' }))
+}
+
 /**
  * research template: the delivered content is durably recorded by the host AND the
  * model consulted at least one source outside the workspace. Keyed on the recorded
@@ -847,6 +935,9 @@ function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, obj
   const query = lastExternalQuery(ctx)
   const delivery = deliveryForQuery(ctx, query)
   if (!ids.length || !delivery || !query) return []
+  // A delivery whose citations do not survive the check is not evidence: the gap is reported
+  // instead, so the refusal names the invented or missing source rather than a generic absence.
+  if (researchCitationGaps(ctx, task).length) return []
   // Research's object is the delivered content tied to that query, not a file set: the digest is
   // derived from the delivery itself and does not move with the working tree.
   const digest = query.digest || objectDigest
@@ -1039,6 +1130,7 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
   let task = confirmed
   let candidate: Candidate = { claims_success: true, response_kind: 'final_delivery', text: ctx.response, requirement_claims: [] }
   let evidence: Verification[]
+  let gaps: Array<{ requirement_id: string; reason: string }> = []
   if (taskType === 'discussion') {
     task = discussionTask(confirmed, ctx)
     candidate = { claims_success: false, response_kind: 'discussion', text: ctx.response, requirement_claims: [] }
@@ -1047,6 +1139,7 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
     evidence = buildDocsEvidence(ctx, confirmed, objectDigest, envDigest)
   } else if (taskType === 'research') {
     evidence = buildResearchEvidence(ctx, confirmed, objectDigest, envDigest)
+    gaps = researchCitationGaps(ctx, confirmed)
   } else if (taskType === 'ops') {
     evidence = buildOpsEvidence(ctx, confirmed, objectDigest, envDigest)
   } else {
@@ -1062,7 +1155,7 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
   const responseSeq = (assistant?.payload as any)?.seq ?? -1
   return {
     request_id: `${ctx.session_id}:${ctx.turn}:${responseSeq}`,
-    task, candidate, candidate_check: candidateCheck, evidence,
+    task, candidate, candidate_check: candidateCheck, evidence, evidence_gaps: gaps,
     hard_constraints_checked: buildHardChecks(task, ctx),
     object_version_digest: objectDigest,
     context_state_digest: `dsh:${ctx.session_id}:turn:${ctx.turn}:events:${ctx.recovery.event_sequence}`,

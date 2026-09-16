@@ -7,5 +7,6 @@
 - `@ironlaw/memory`: Git-backed, source-scoped shared memory MCP server with
   BM25 search and ACI injection.
 - `@ironlaw/adapter-dsh`: DeepSeek Harness native Cordis plugin — host-side evidence and
-  completion gate (`ironlaw/2.0-p1`): evidence ledger, per-task-type acceptance templates,
-  host-checked prohibitions, per-file object versions, bounded repair.
+  completion gate (`ironlaw/2.0-p2`): evidence ledger, per-task-type acceptance templates,
+  host-checked prohibitions, per-file object versions, authenticated citations for research,
+  bounded repair.
