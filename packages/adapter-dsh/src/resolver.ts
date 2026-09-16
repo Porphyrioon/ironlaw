@@ -928,7 +928,7 @@ function researchCitationGaps(ctx: ResolveAuditContext, task: TaskContract): Arr
  * delivery event. Without a recorded delivery or an external query, no proof (fail
  * closed) — a conclusion drawn from nothing but local files is not research. The proof is
  * attributed to the revision of the query it rests on, so a search from an earlier task
- * revision cannot close a new one, and it attests the object version captured at that query.
+ * revision cannot close a new one.
  */
 function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
   const ids = acceptanceIds(task)
@@ -938,9 +938,12 @@ function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, obj
   // A delivery whose citations do not survive the check is not evidence: the gap is reported
   // instead, so the refusal names the invented or missing source rather than a generic absence.
   if (researchCitationGaps(ctx, task).length) return []
-  // Research's object is the delivered content tied to that query, not a file set: the digest is
-  // derived from the delivery itself and does not move with the working tree.
-  const digest = query.digest || objectDigest
+  // Research's object is the delivered content, whose digest comes from the delivery and does not
+  // move with the working tree — the same value `objectDigestFor('research')` hands the audit.
+  // Preferring the search call's own file capture here (which a live session always has once it
+  // has touched a file) made the proof disagree with the input digest on every real run, so a
+  // correct delivery was reported `evidence_stale` and could never close.
+  const digest = objectDigest
   if (!digest) return []
   return [{
     event_id: `verify:${delivery.ref}`, task_id: task.task_id,

@@ -553,6 +553,24 @@ test('R7 older evidence that never ran a verification is a missing run, not a fa
     'a read is not a verification run, so its absence is not a failed one')
 })
 
+// R8 (live session, 2026-09-16): a research proof carried the file capture of the search call when
+// the session had one, while the audit compares against the delivery's identity. On a real session
+// the two never agreed, so a correct delivery was reported `evidence_stale` forever — the fixture
+// had only ever searched before touching any file, which left the capture empty.
+test('R8 research verifies when the search call carries a file capture of its own', t => {
+  const root = fixture(t), code = join(root, 'login.js')
+  writeFileSync(code, 'a\n')
+  const h = host(root)
+  user(h, '调研一下市面上的方案')
+  edit(h, 'e1', code, 2, 3)
+  searched(h, 's1', 'options', '1. https://example.com/options — comparison', 4, 5)
+  assistant(h, '结论：方案 A 更合适，见 https://example.com/options。', 6)
+  h.stop(1)
+  const d = decision(root)
+  assert.equal(d.verdict, 'verified_complete',
+    `the delivery is the object, not the search's file capture: ${JSON.stringify({ reasons: d.reason_codes, missing: d.missing_requirements })}`)
+})
+
 // T3 (third review): three ways of dropping an attempt each let an earlier success stand for
 // work that had not happened — a call whose result never arrived, a masked retry that cannot be
 // confirmed, and a different target entirely.
