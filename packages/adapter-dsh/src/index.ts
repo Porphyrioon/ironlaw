@@ -8,7 +8,7 @@ import { destructiveReason } from './policy.js'
 import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
 import { defaultResolveAudit } from './resolver.js'
 import { classifyTaskType } from './classify.js'
-import { snapshotObjectVersion, touchedPathsOf } from './snapshot.js'
+import { snapshotObjectVersions, touchedPathsOf, versionDigestOf } from './snapshot.js'
 
 /**
  * The declared contract. Applicability and authorization found while adjudicating one revision
@@ -156,9 +156,11 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     const exitCode = canonicalExitCode(result.isError ? undefined : result.value)
     const command = canonicalCommand(exec.arguments)
     const callId = typeof exec.callId === 'string' ? exec.callId : ''
-    const objectDigest = snapshotObjectVersion(touchedFor(sessionId))
+    const versions = snapshotObjectVersions(touchedFor(sessionId))
+    const objectDigest = versionDigestOf(versions)
     if (!callId || (exitCode === null && !command && !objectDigest)) return
-    const outcome = { tool_call_id: callId, name: exec.name, command, exit_code: exitCode, is_error: result.isError, object_version_digest: objectDigest }
+    const outcome = { tool_call_id: callId, name: exec.name, command, exit_code: exitCode, is_error: result.isError,
+      object_version_digest: objectDigest, object_versions: versions }
     const outcomeLink = { tool_call_id: callId, exit_code: exitCode }
     recordDerived(sessionId, 'tool.outcome', outcome,
       { ...outcomeLink, event_id: versionedId(`dsh:${sessionId}:outcome:${callId}`, outcome, outcomeLink) })

@@ -11,6 +11,14 @@ export interface Requirement {
   applicability: 'applicable' | 'not_applicable' | 'unknown'
   status: Status
   superseded_by?: string
+  /** What this item is about, as the host read it from the request: a path, a document name,
+   * a directory. Acceptance items are matched to their OWN artifacts through this, so a
+   * request naming two targets cannot be closed by producing one of them. */
+  scope?: string[]
+  /** For a prohibition: the content digest of the protected object when the revision started.
+   * The host re-reads that object at adjudication time and can therefore check the constraint
+   * itself instead of reporting it as unconfirmable. */
+  baseline_digest?: string
   /** Only the host authority resolver may authorize exclusions. */
   exclusion?: { authorized: boolean; source_ref: string; reason: string }
 }
@@ -31,6 +39,10 @@ export interface HardConstraintCheck {
 export interface Verification {
   event_id: string; task_id: string; objective_revision: number; requirement_ids: string[]
   object_version_digest: string; environment_digest: string; status: Status; complete: boolean
+  /** The per-file snapshot this proof was captured against, when it attests a file set. The
+   * resolver re-checks these files at adjudication time; the aggregate digest above stays a
+   * consistency tag between proof and input rather than the thing that decides staleness. */
+  object_versions?: Record<string, string>
   source_kind: 'host_verifier' | 'model' | 'summary'; verifier_ref: string; output_ref: string
   tool_call_id?: string; exit_code?: number | null; requires_exit_code?: boolean
   assertion_passed: boolean | null; expires_at?: number

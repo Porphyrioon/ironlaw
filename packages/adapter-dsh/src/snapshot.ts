@@ -1,4 +1,6 @@
-import { accessSync, constants, statSync } from 'node:fs'
+import { accessSync, constants, readFileSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { resolve } from 'node:path'
 import { objectVersionDigest } from './fingerprint.js'
 
 /** Shell tools whose command text can name a file they wrote. */
@@ -164,6 +166,47 @@ export function snapshotObjectVersion(paths: Iterable<string>): string {
   const files = readableRegularFiles([...paths])
   if (!files.length) return ''
   try { return objectVersionDigest(files) } catch { return '' }
+}
+
+/**
+ * The same snapshot, kept **per file**: absolute path -> content hash. One aggregate digest for
+ * the whole scope cannot be re-checked later, because the scope itself keeps growing — a file
+ * written after a verification changed the aggregate and made a perfectly valid proof look
+ * stale, turn after turn. With the per-file map the proof can be re-checked against exactly the
+ * files it captured.
+ */
+export function snapshotObjectVersions(paths: Iterable<string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const file of readableRegularFiles([...paths])) {
+    try {
+      out[resolve(file)] = createHash('sha256').update(readFileSync(file)).digest('hex')
+    } catch { /* unreadable between the check and the read: not captured */ }
+  }
+  return out
+}
+
+/** A stable digest of a per-file snapshot, for the record's single `object_version_digest` field. */
+export function versionDigestOf(versions: Record<string, string>): string {
+  const entries = Object.entries(versions).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return entries.length ? `sha256:${createHash('sha256').update(JSON.stringify(entries)).digest('hex')}` : ''
+}
+
+/**
+ * True while every file the snapshot captured is still readable and byte-identical. This is the
+ * question a proof actually needs answered — "do the files this run attested still look the way
+ * they did when it ran?" — and it is answerable without knowing what else the session touched.
+ */
+export function snapshotHolds(versions: Record<string, string>): boolean {
+  const entries = Object.entries(versions ?? {})
+  if (!entries.length) return false
+  for (const [path, hash] of entries) {
+    try {
+      if (!statSync(path).isFile()) return false
+      accessSync(path, constants.R_OK)
+      if (createHash('sha256').update(readFileSync(path)).digest('hex') !== hash) return false
+    } catch { return false }
+  }
+  return true
 }
 
 /**

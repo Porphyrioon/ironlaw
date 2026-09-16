@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import type { EvidenceLedger, EvidenceRecord } from './evidence.js'
 import { objectVersionDigest } from './fingerprint.js'
 import { classifyTaskType, isTaskType, hostReadable, type TaskType } from './classify.js'
-import { SHELL_TOOL, readableRegularFiles, shellWriteTargets } from './snapshot.js'
+import { SHELL_TOOL, readableRegularFiles, shellWriteTargets, snapshotHolds } from './snapshot.js'
 import type { AuditInput, Candidate, HardConstraintCheck, Status, TaskContract, Verification } from './audit.js'
 
 /**
@@ -240,7 +240,7 @@ function isTrustworthyVerification(cmd: string, dialect: ShellDialect): boolean 
  * recomputed: re-deriving it at adjudication time re-bound an old passing run to whatever the
  * tree had become since, which is exactly the invalidation the digest exists to provide.
  */
-interface CallOutcome { exit: number; cmd: string; digest: string }
+interface CallOutcome { exit: number; cmd: string; digest: string; versions: Record<string, string> }
 
 /**
  * Canonical outcomes by call id. A real DSH session puts the exit code only in the
@@ -261,7 +261,7 @@ function outcomesByCallId(ctx: ResolveAuditContext): Map<string, CallOutcome> {
     const digest = typeof r.object_version_digest === 'string' && r.object_version_digest
       ? r.object_version_digest
       : typeof (r.payload as any)?.object_version_digest === 'string' ? (r.payload as any).object_version_digest : ''
-    out.set(id, { exit, cmd: typeof cmd === 'string' ? cmd : '', digest })
+    out.set(id, { exit, cmd: typeof cmd === 'string' ? cmd : '', digest, versions: versionsOf(r) })
   }
   return out
 }
@@ -280,6 +280,28 @@ function digestsByCallId(ctx: ResolveAuditContext): Map<string, string> {
     const digest = typeof r.object_version_digest === 'string' && r.object_version_digest ? r.object_version_digest
       : typeof (r.payload as any)?.object_version_digest === 'string' ? (r.payload as any).object_version_digest : ''
     if (digest) out.set(id, digest)
+  }
+  return out
+}
+
+/** The per-file snapshot a `tool.outcome` captured, when the host recorded one. */
+function versionsOf(record: EvidenceRecord): Record<string, string> {
+  const raw = (record.payload as any)?.object_versions
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const out: Record<string, string> = {}
+  for (const [path, hash] of Object.entries(raw)) if (typeof hash === 'string') out[path] = hash
+  return out
+}
+
+/** Per-file snapshots by call id, for every tool result that captured one. */
+function versionsByCallId(ctx: ResolveAuditContext): Map<string, Record<string, string>> {
+  const out = new Map<string, Record<string, string>>()
+  for (const r of ctx.records) {
+    if (r.type !== 'tool.outcome') continue
+    const id = r.tool_call_id
+    if (typeof id !== 'string' || !id) continue
+    const versions = versionsOf(r)
+    if (Object.keys(versions).length) out.set(id, versions)
   }
   return out
 }
@@ -428,19 +450,21 @@ function buildEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDiges
     const determinate = status === 'passed' || status === 'failed'
     // Relevance + anti-masking gate: only an unmasked verification-class command speaks to acceptance.
     const verifiesAcceptance = !!t && isTrustworthyVerification(t.cmd, dialectOf(callData.name))
-    // A proof may only speak for the object version captured when the tool ran. No capture
-    // (the run predates any observed file, or the record predates this mechanism) means the
-    // proof cannot be tied to a version at all, so it claims no requirement instead of
-    // borrowing the current version and vouching for files it never saw.
-    const captured = t?.digest ?? ''
-    const attestable = !!t && !!captured
+    // The files this run captured must still look exactly as they did when it ran. That is the
+    // real question — and unlike comparing two moving aggregate digests it does not turn stale
+    // just because the session later touched some other file. When they no longer match, the
+    // proof is kept but marked stale, so the gate reports `evidence_stale` (re-run it) instead
+    // of pretending no run was ever recorded.
+    const held = !!t && snapshotHolds(t.versions)
     out.push({
       event_id: `verify:${c.result.event_id}`,
       task_id: c.result.task_id ?? task.task_id,
       objective_revision: c.result.objective_revision ?? task.objective_revision,
-      requirement_ids: verifiesAcceptance && determinate && attestable ? applicableIds : [],
-      object_version_digest: captured, environment_digest: envDigest,
-      status, complete: true, source_kind: 'host_verifier',
+      requirement_ids: verifiesAcceptance && determinate ? applicableIds : [],
+      object_version_digest: objectDigest, environment_digest: envDigest,
+      object_versions: t?.versions,
+      status: verifiesAcceptance && determinate && !held ? 'stale' : status,
+      complete: true, source_kind: 'host_verifier',
       verifier_ref: `dsh-tool:${toolName}:${c.tool_call_id}`,
       output_ref: c.result.output_ref ?? c.result.event_id,
       tool_call_id: c.tool_call_id, exit_code: exitCode,
@@ -608,7 +632,7 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
   if (!ids.length) return out
   const named = namedTargets(humanRequestText(ctx))
   const outcomes = outcomesByCallId(ctx)
-  const captured = digestsByCallId(ctx)
+  const versions = versionsByCallId(ctx)
   for (const c of ctx.recovery.calls) {
     if (!hostOk(c)) continue
     const callData = dataOf(c.call), meta = dataOf(c.result).meta
@@ -626,16 +650,16 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
     if (shellWrote) for (const p of shellWriteTargets(command, dialectOf(callName))) candidates.push(p)
     const written = candidates.filter(p => hostReadable(p) && answersDocsRequest(p, named))
     if (!written.length) continue
-    // The artifact must be attested at the version captured when the write happened; without
-    // that capture the proof cannot say which version the document was, so it is not minted.
-    const writeDigest = captured.get(c.tool_call_id ?? '') ?? ''
-    if (!writeDigest) continue
+    // The document must still be the file the write captured; a later edit to it means this
+    // proof no longer speaks for what is on disk, so it is kept and marked stale.
+    const writeVersions = versions.get(c.tool_call_id ?? '') ?? {}
+    const held = snapshotHolds(writeVersions)
     out.push({
       event_id: `verify:${c.result.event_id}`, task_id: c.result.task_id ?? task.task_id,
       objective_revision: c.result.objective_revision ?? task.objective_revision,
-      requirement_ids: ids, object_version_digest: writeDigest,
-      environment_digest: envDigest,
-      status: 'passed', complete: true, source_kind: 'host_verifier',
+      requirement_ids: ids, object_version_digest: objectDigest,
+      environment_digest: envDigest, object_versions: writeVersions, status: held ? 'passed' : 'stale',
+      complete: true, source_kind: 'host_verifier',
       verifier_ref: `dsh-host:docs-artifact:${written[0]}`, output_ref: c.result.output_ref ?? c.result.event_id,
       requires_exit_code: false, exit_code: null, assertion_passed: true,
     })

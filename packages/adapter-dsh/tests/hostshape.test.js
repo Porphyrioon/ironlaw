@@ -445,6 +445,48 @@ test('R5 quoted and bare Windows paths written by Set-Content or tee still verif
   }
 })
 
+// The nag this replaces: after a verification, the session touches a NEW file. That file was
+// never part of what the run attested, so the proof has to survive. Comparing two aggregate
+// scope digests made it stale every turn, over a change the run never claimed to cover.
+test('T6 a later unrelated file does not invalidate a passing run', t => {
+  const root = fixture(t), code = join(root, 'login.js'), notes = join(root, 'notes.md')
+  writeFileSync(code, 'b\n')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  edit(h, 'e1', code, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+  assert.equal(decision(root).verdict, 'verified_complete')
+
+  writeFileSync(notes, 'scratch\n')
+  edit(h, 'e2', notes, 7, 8)
+  assistant(h, '又记了点笔记。', 9)
+  h.stop(2)
+  assert.equal(decision(root).verdict, 'verified_complete',
+    'a file the run never captured must not invalidate it')
+})
+
+// ...and the mirror image: a captured file that changes afterwards does invalidate it.
+test('T6b a change to a captured file does invalidate the run', t => {
+  const root = fixture(t), code = join(root, 'login.js')
+  writeFileSync(code, 'b\n')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  edit(h, 'e1', code, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+  assert.equal(decision(root).verdict, 'verified_complete')
+
+  writeFileSync(code, 'throw new Error("broken")\n')
+  assistant(h, '又改了一点。', 7)
+  h.stop(2)
+  const d = decision(root)
+  assert.notEqual(d.verdict, 'verified_complete')
+  assert.deepEqual(d.missing_requirements.map(m => m.missing_reason), ['evidence_stale'])
+})
+
 // The non-shell templates keep working on the real shapes.
 test('G docs: a real edit with card-free diffs meta still verifies', t => {  const root = fixture(t), readme = join(root, 'README.md'); writeFileSync(readme, '# Title\n')
   const h = host(root)
