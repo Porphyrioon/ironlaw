@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
-import { isAbsolute, resolve } from 'node:path'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
 import type { Requirement } from './audit.js'
 
 /**
@@ -90,6 +90,58 @@ export function contentDigest(path: string): string {
   try { return `sha256:${createHash('sha256').update(readFileSync(path)).digest('hex')}` } catch { return '' }
 }
 
+/**
+ * How many entries a directory digest may visit before the host gives up. A prohibition can name
+ * any directory, including one with a hundred thousand files, and an unbounded walk would turn
+ * adjudication into a filesystem sweep.
+ */
+const TREE_LIMIT = 400
+
+/**
+ * The digest of whatever object a path names: a file's content, or a directory's whole tree
+ * (sorted relative paths and their contents). Empty when the host cannot read it — an unreadable
+ * path, a tree larger than {@link TREE_LIMIT} — which the caller reports as unknown rather than
+ * as "unchanged". Without the directory case a stated prohibition over a directory — the shape
+ * the README itself uses, 「不要改 config/」 — was recorded but protected nothing.
+ */
+export function objectDigest(path: string): string {
+  const single = contentDigest(path)
+  if (single) return single
+  let stat
+  try { stat = statSync(path) } catch { return '' }
+  if (!stat.isDirectory()) return ''
+  const entries: Array<[string, string]> = []
+  const walk = (at: string, rel: string): boolean => {
+    let names: string[]
+    try { names = readdirSync(at) } catch { return false }
+    for (const name of names.sort()) {
+      if (entries.length >= TREE_LIMIT) return false
+      const full = join(at, name), child = rel ? `${rel}/${name}` : name
+      let child_
+      try { child_ = statSync(full) } catch { continue }
+      if (child_.isDirectory()) { if (!walk(full, child)) return false; continue }
+      if (!child_.isFile()) continue
+      try { entries.push([child, createHash('sha256').update(readFileSync(full)).digest('hex')]) }
+      catch { return false }
+    }
+    return true
+  }
+  if (!walk(path, '')) return ''
+  return `sha256:${createHash('sha256').update(JSON.stringify(entries)).digest('hex')}`
+}
+
+/**
+ * Does a prohibition name an object at all? A path separator, a file extension or a conventional
+ * document name does; a bare phrase — 「不要动代码」 — does not. Only the first kind can become a
+ * host-checked item: manufacturing an item for the second produced a requirement neither the
+ * evidence nor any repair could ever close. A non-global copy on purpose: the shared `DOC_NAME`
+ * carries the `g` flag, so testing with it would advance `lastIndex` between calls.
+ */
+const DOC_NAME_ONE = /\b(?:readme|changelog|licen[cs]e|contributing|notice|security|code_of_conduct)\b/i
+export function namesAnObject(name: string): boolean {
+  return /[\\/]/.test(name) || /\.[A-Za-z]/.test(name) || DOC_NAME_ONE.test(name)
+}
+
 export interface DeclaredInput {
   /** The human request, verbatim. */
   text: string
@@ -109,8 +161,14 @@ export interface DeclaredInput {
   baseDir?: string
 }
 
+/** The contract a request declares, and the prohibitions the host cannot represent as checks. */
+export interface DeclaredContract {
+  requirements: Requirement[]
+  unrepresentable_prohibitions: string[]
+}
+
 /** The object a path names, resolved against the session workspace when it is relative. */
-function resolvable(path: string, baseDir?: string): string {
+export function resolvable(path: string, baseDir?: string): string {
   if (!path) return ''
   if (isAbsolute(path)) return path
   return baseDir ? resolve(baseDir, path) : ''
@@ -124,15 +182,17 @@ function resolvable(path: string, baseDir?: string): string {
  * item. Other types get a single acceptance item — a test run covers a repository, not a named
  * file, so inventing per-file acceptance for code would demand evidence no host can produce.
  *
- * Every stated prohibition becomes a hard item carrying the digest of what it protects at the
- * moment the revision started — when the host can actually open that object. A prohibition the
- * host cannot read (a relative path in a session with no known working directory, or a phrase
- * that names no file at all) still becomes an item, with an empty baseline: the resolver then
- * decides per turn between an observed write that breaks it and an authorized exclusion, so the
- * constraint is never silently dropped and never blocks every future turn either.
+ * A stated prohibition over an object becomes a hard item carrying that object's digest at the
+ * moment the revision started — a file's content, or a directory's tree. When the host cannot
+ * open or resolve the object the item keeps an empty baseline and stays `unknown` at
+ * adjudication: spec §3 requires an unconfirmable hard item to be kept and listed as pending
+ * review, not judged inapplicable. A prohibition that names no object at all is reported in
+ * `unrepresentable_prohibitions` instead of becoming a requirement, because a requirement no
+ * evidence can ever satisfy is a refusal that cannot terminate (spec §8).
  */
-export function declaredRequirements(input: DeclaredInput): Requirement[] {
+export function declaredRequirements(input: DeclaredInput): DeclaredContract {
   const out: Requirement[] = []
+  const unrepresentable: string[] = []
   const targets = [...new Set(input.targets.map(t => t.trim()).filter(Boolean))].slice(0, 5)
   if (input.perTarget && targets.length) {
     targets.forEach((target, i) => out.push({
@@ -146,10 +206,18 @@ export function declaredRequirements(input: DeclaredInput): Requirement[] {
     })
   }
   const prohibited = input.prohibited ?? prohibitionTargets(input.text)
-  ;[...new Set(prohibited.map(t => t.trim()).filter(Boolean))].slice(0, 5).forEach((path, i) => out.push({
-    requirement_id: `HC-${i + 1}`, class: 'hard', source_kind: 'user_instruction',
-    source_ref: input.sourceRef, applicability: 'unknown', status: 'unknown',
-    scope: [resolvable(path, input.baseDir) || path], baseline_digest: contentDigest(resolvable(path, input.baseDir)),
-  }))
-  return out
+  let index = 0
+  for (const path of [...new Set(prohibited.map(t => t.trim()).filter(Boolean))].slice(0, 5)) {
+    if (!namesAnObject(path)) { unrepresentable.push(path); continue }
+    const dir = /[\\/]$/.test(path)
+    // One trailing separator, exactly: an absolute path in the request may already carry one.
+    const stripped = resolvable(path, input.baseDir).replace(/[\\/]+$/, '')
+    const scope = stripped ? `${stripped}${dir ? '/' : ''}` : path
+    out.push({
+      requirement_id: `HC-${++index}`, class: 'hard', source_kind: 'user_instruction',
+      source_ref: input.sourceRef, applicability: 'unknown', status: 'unknown',
+      scope: [scope], baseline_digest: objectDigest(stripped),
+    })
+  }
+  return { requirements: out, unrepresentable_prohibitions: unrepresentable }
 }

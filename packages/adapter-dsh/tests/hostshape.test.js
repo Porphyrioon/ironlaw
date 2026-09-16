@@ -12,7 +12,7 @@
 // card-free, which is the shape the resolver has to work against.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EvidenceLedger } from '../lib/evidence.js'
@@ -588,9 +588,10 @@ test('F3 a stated prohibition is checked by the host', t => {
     `an untouched prohibition is compliant: ${JSON.stringify(dc.missing_requirements)}`)
 })
 
-// F3 follow-up: a prohibition must never become an item no turn can satisfy. The host can only
-// check an object it can open; when it cannot, it either sees the write itself or says so.
-test('F3 a prohibition the host cannot open is excluded, not a permanent block', t => {
+// F3 follow-up: a prohibition that names no object cannot become a requirement. Spec §3 keeps an
+// unconfirmable hard item pending review, but an item no evidence and no repair can ever close is
+// a refusal that cannot terminate (§8), so the contract records the phrase instead of checking it.
+test('F3 a prohibition that names no object is recorded, not enforced', t => {
   const root = fixture(t), readme = join(root, 'README.md')
   writeFileSync(readme, '# Title\n')
   const h = host(root)
@@ -598,9 +599,93 @@ test('F3 a prohibition the host cannot open is excluded, not a permanent block',
   edit(h, 'w1', readme, 2, 3)
   assistant(h, '只改了 README。', 4)
   h.stop(1)
+  const task = ledger(root).task('session')
+  assert.deepEqual(task.unrepresentable_prohibitions, ['代码'],
+    'the phrase is kept in the contract for provenance')
+  assert.ok(!task.requirements.some(r => r.class === 'hard'),
+    `a phrase that names no object is not a host-checkable item: ${JSON.stringify(task.requirements)}`)
+  assert.equal(decision(root).verdict, 'verified_complete')
+})
+
+test('F3 an unresolvable prohibition stays pending review, not inapplicable', t => {
+  const root = fixture(t), gone = join(root, 'never-created-4f2b.txt'), code = join(root, 'login.js')
+  writeFileSync(code, 'a\n')
+  const h = host(root) // no session cwd: the absolute path is readable, the object is simply absent
+  user(h, `修复 login.js 的 bug 并跑测试，不要修改 ${gone}`)
+  edit(h, 'e1', code, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复。', 6)
+  h.stop(1)
   const d = decision(root)
-  assert.ok(!d.missing_requirements.some(m => m.missing_reason === 'hard_constraint_unconfirmed'),
-    `a phrase that names no file must not block forever: ${JSON.stringify(d.missing_requirements)}`)
+  const check = d.hard_constraints_checked.find(c => c.requirement_id === 'HC-1')
+  assert.equal(check?.applicability, 'unknown',
+    `the host may not judge an unverifiable constraint inapplicable: ${JSON.stringify(check)}`)
+  assert.match(check.check_ref, /hard-unresolved/,
+    'the check names why it could not be decided')
+  assert.ok(d.missing_requirements.some(m => m.missing_reason === 'hard_constraint_unconfirmed'),
+    `an unconfirmable prohibition is listed for review: ${JSON.stringify(d.missing_requirements)}`)
+})
+
+test('F3 a same-named file in another directory is not a violation', t => {
+  const root = fixture(t), code = join(root, 'login.js')
+  writeFileSync(code, 'a\n')
+  const h = host(root)
+  user(h, `修复 login.js 的 bug 并跑测试，不要修改 ${join(root, 'missing', 'config', 'app.yml')}`)
+  edit(h, 'e1', code, 2, 3)
+  edit(h, 'e2', join(root, 'other', 'app.yml'), 4, 5)
+  shell(h, 'v1', 'npm test', 0, 6, 7)
+  assistant(h, '已修复。', 8)
+  h.stop(1)
+  const check = decision(root).hard_constraints_checked.find(c => c.requirement_id === 'HC-1')
+  assert.notEqual(check?.status, 'violated',
+    `a path with directory components must not match on its basename alone: ${JSON.stringify(check)}`)
+})
+
+test('F3 a prohibition over a directory covers what is written under it', t => {
+  const root = fixture(t), config = join(root, 'config'), code = join(root, 'login.js')
+  mkdirSync(config, { recursive: true })
+  writeFileSync(join(config, 'app.yml'), 'a: 1\n'); writeFileSync(code, 'a\n')
+  const h = host(root)
+  user(h, `修复 login.js 的 bug 并跑测试，不要改 ${config}/`)
+  edit(h, 'e1', code, 2, 3)
+  edit(h, 'e2', join(config, 'app.yml'), 4, 5)
+  shell(h, 'v1', 'npm test', 0, 6, 7)
+  assistant(h, '已修复。', 8)
+  h.stop(1)
+  const check = decision(root).hard_constraints_checked.find(c => c.requirement_id === 'HC-1')
+  assert.equal(check?.status, 'violated',
+    `a write under the named directory is the violation: ${JSON.stringify(check)}`)
+})
+
+test('F3 a directory prohibition sees a change the session did not make', t => {
+  const root = fixture(t), config = join(root, 'config'), code = join(root, 'login.js')
+  mkdirSync(config, { recursive: true })
+  writeFileSync(join(config, 'app.yml'), 'a: 1\n'); writeFileSync(code, 'a\n')
+  const h = host(root)
+  user(h, `修复 login.js 的 bug 并跑测试，不要改 ${config}/`)
+  edit(h, 'e1', code, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  writeFileSync(join(config, 'app.yml'), 'a: 2\n') // no tool call: only the tree digest can see it
+  assistant(h, '已修复。', 6)
+  h.stop(1)
+  const check = decision(root).hard_constraints_checked.find(c => c.requirement_id === 'HC-1')
+  assert.equal(check?.status, 'violated',
+    `the directory digest covers files the session never named: ${JSON.stringify(check)}`)
+})
+
+test('F3 a prohibition over an untouched directory is compliant', t => {
+  const root = fixture(t), config = join(root, 'config'), code = join(root, 'login.js')
+  mkdirSync(config, { recursive: true })
+  writeFileSync(join(config, 'app.yml'), 'a: 1\n'); writeFileSync(code, 'a\n')
+  const h = host(root)
+  user(h, `修复 login.js 的 bug 并跑测试，不要改 ${config}/`)
+  edit(h, 'e1', code, 2, 3)
+  shell(h, 'v1', 'npm test', 0, 4, 5)
+  assistant(h, '已修复。', 6)
+  h.stop(1)
+  const d = decision(root)
+  const check = d.hard_constraints_checked.find(c => c.requirement_id === 'HC-1')
+  assert.equal(check?.status, 'compliant', `an untouched tree is compliant: ${JSON.stringify(check)}`)
   assert.equal(d.verdict, 'verified_complete')
 })
 

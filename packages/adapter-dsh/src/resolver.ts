@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import type { EvidenceLedger, EvidenceRecord } from './evidence.js'
 import { objectVersionDigest } from './fingerprint.js'
 import { classifyTaskType, isTaskType, hostReadable, type TaskType } from './classify.js'
-import { contentDigest } from './contract.js'
+import { contentDigest, objectDigest } from './contract.js'
 import { SHELL_TOOL, readableRegularFiles, shellWriteTargets, snapshotHolds } from './snapshot.js'
 import type { AuditInput, Candidate, HardConstraintCheck, Requirement, Status, TaskContract, Verification } from './audit.js'
 
@@ -54,16 +54,41 @@ const stemOf = (base: string): string => base.replace(/\.[^.]+$/, '')
 const slashOf = (path: string): string => path.replace(/\\/g, '/').toLowerCase()
 
 /**
- * Does a stated prohibition name the same object as a target the request names? Compared on the
- * normalized path or the basename, because a request may say `protected.txt` where the session
- * would open `D:\proj\protected.txt`. The deliverable list excludes prohibited objects: a path
- * the human forbade changing cannot also be a document they are waiting for, and keeping both
- * made the two requirements contradict each other so no turn could ever close.
+ * Does a prohibition cover a target the request names? Deliberately permissive — the normalized
+ * path or the basename — because this decides only which objects are kept OUT of the deliverable
+ * list: a path the human forbade changing must not also be demanded as a document, and
+ * over-matching here removes a requirement instead of inventing a violation. Violation detection
+ * is the stricter {@link breaksProhibition}, and the two are deliberately different questions.
  */
-export function sameNamedObject(a: string, b: string): boolean {
-  const na = slashOf(a).replace(/\/+$/, ''), nb = slashOf(b).replace(/\/+$/, '')
+export function prohibitionCoversTarget(prohibition: string, target: string): boolean {
+  const na = slashOf(prohibition).replace(/\/+$/, ''), nb = slashOf(target).replace(/\/+$/, '')
   if (!na || !nb) return false
   return na === nb || baseName(na) === baseName(nb)
+}
+
+/**
+ * Does an observed write break this prohibition? Stricter than the deliverable filter, because a
+ * false match here says the agent violated a constraint it never touched:
+ *
+ * - A prohibition carrying directory components is matched as a path suffix at a segment
+ *   boundary, so `config/app.yml` does not match `other/app.yml`. Basename-only matching reported
+ *   exactly that violation for a file in a different directory.
+ * - A prohibition ending in a separator names a directory: anything under it matches.
+ * - A bare name (`protected.txt`, `README`) leaves only the basename to compare, and the check
+ *   reference records that as the basis of the verdict.
+ */
+function breaksProhibition(scope: string, written: string): boolean {
+  const raw = slashOf(scope), na = raw.replace(/\/+$/, ''), nb = slashOf(written)
+  if (!na || !nb) return false
+  if (raw.endsWith('/') && nb.startsWith(raw)) return true
+  if (nb === na) return true
+  if (/[\\/]/.test(scope)) return nb.endsWith(`/${na}`)
+  return baseName(nb) === na
+}
+
+/** The first observed write that breaks this prohibition, if any. */
+function violatingWrite(scope: string, written: string[]): string | undefined {
+  return written.find(p => breaksProhibition(scope, p))
 }
 
 /** Shell tools whose command text can name a file they wrote. */
@@ -944,49 +969,26 @@ function writtenPaths(records: EvidenceRecord[]): string[] {
 }
 
 /**
- * Classify the prohibitions whose object the host cannot read. A stated prohibition must not
- * disappear, and it must not become an item no turn can ever satisfy either: an item whose
- * baseline is unreadable and which no observed write touches is excluded by host authority,
- * with the reason recorded, so the gate says "outside my reach" instead of blocking forever.
- * If the revision did write an object with that name, the prohibition stays applicable and the
- * check below reports the violation.
- */
-function withCheckableProhibitions(task: TaskContract, ctx: ResolveAuditContext): TaskContract {
-  const written = writtenPaths(ctx.records)
-  const requirements = task.requirements.map(r => {
-    if (r.class !== 'hard' || r.baseline_digest || !r.scope?.[0]) return r
-    const named = baseName(r.scope[0])
-    const hit = written.some(p => baseName(p) === named)
-    return hit ? { ...r, applicability: 'applicable' as const } : {
-      ...r, applicability: 'not_applicable' as const,
-      exclusion: { authorized: true, source_ref: r.source_ref,
-        reason: `the host cannot open ${r.scope[0]}, and no observed write names it` },
-    }
-  })
-  return { ...task, requirements }
-}
-
-/**
- * Hard constraints are listed one-by-one. A prohibition the host captured a baseline for can be
- * checked by the host itself: it re-reads the protected object and compares. One whose object it
- * cannot open is checked against the writes the host actually observed, and otherwise stays an
- * authorized exclusion rather than a permanently unconfirmable requirement. A hard item with
- * neither a baseline nor an exclusion stays `unknown` and fails closed
- * (`hard_constraint_unconfirmed`) rather than being asserted compliant without trusted proof.
+ * Hard constraints are listed one-by-one, and a prohibition is decided in this order:
+ *
+ * 1. A write the host actually observed under that name is a violation, whatever the object looks
+ *    like afterwards — the human said not to touch it, and restoring the bytes does not undo the
+ *    write the gate watched.
+ * 2. A captured baseline (file content, or a directory's tree) is re-read and compared.
+ * 3. With neither, the item stays `unknown`: spec §3 keeps an unconfirmable hard item and lists
+ *    it for review, and the only thing the host may not do is declare it satisfied.
  */
 function buildHardChecks(task: TaskContract, ctx: ResolveAuditContext): HardConstraintCheck[] {
   const written = writtenPaths(ctx.records)
   return task.requirements.filter(r => r.class === 'hard').map(r => {
     const scope = r.scope?.[0]
-    if (!scope || !r.baseline_digest) {
-      const named = scope ? baseName(scope) : ''
-      const hit = named ? written.find(p => baseName(p) === named) : undefined
-      if (hit) return { requirement_id: r.requirement_id, applicability: 'applicable' as const,
-        status: 'violated' as const, check_ref: `dsh-host:observed-write:${slashOf(hit)}` }
-      return { requirement_id: r.requirement_id, applicability: r.applicability,
-        status: 'unknown' as const, check_ref: `host:hard:${r.requirement_id}` }
-    }
-    const now = contentDigest(scope)
+    const hit = scope ? violatingWrite(scope, written) : undefined
+    if (hit) return { requirement_id: r.requirement_id, applicability: 'applicable' as const,
+      status: 'violated' as const, check_ref: `dsh-host:observed-write:${slashOf(hit)}` }
+    if (!scope || !r.baseline_digest) return { requirement_id: r.requirement_id,
+      applicability: 'unknown' as const, status: 'unknown' as const,
+      check_ref: `host:hard-unresolved:${scope || r.requirement_id}` }
+    const now = objectDigest(scope.replace(/[\\/]+$/, ''))
     const status: HardConstraintCheck['status'] = !now ? 'unknown' : now === r.baseline_digest ? 'compliant' : 'violated'
     return { requirement_id: r.requirement_id, applicability: r.applicability, status,
       check_ref: `dsh-host:unchanged:${scope}` }
@@ -1055,9 +1057,8 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
   // blocker's evidence_ref): an id is only ever written once, under one object version.
   evidence = evidence.map(proofVersionId)
 
-  // A prohibition the host cannot open is either broken by an observed write or excluded by
-  // host authority; the returned task carries that classification into the audit.
-  task = withCheckableProhibitions(task, ctx)
+  // A prohibition the host cannot open is either broken by an observed write or reported
+  // unknown; the returned task carries only prohibitions the host can actually represent.
   const responseSeq = (assistant?.payload as any)?.seq ?? -1
   return {
     request_id: `${ctx.session_id}:${ctx.turn}:${responseSeq}`,

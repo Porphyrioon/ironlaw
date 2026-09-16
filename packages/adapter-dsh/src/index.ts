@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { EvidenceLedger, type Association, type EvidenceRecord } from './evidence.js'
 import { destructiveReason } from './policy.js'
 import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
-import { defaultResolveAudit, namedTargets, sameNamedObject } from './resolver.js'
+import { defaultResolveAudit, namedTargets, prohibitionCoversTarget } from './resolver.js'
 import { classifyTaskType } from './classify.js'
 import { declaredRequirements, prohibitionTargets, withoutProhibitions } from './contract.js'
 import { snapshotObjectVersions, touchedPathsOf, versionDigestOf } from './snapshot.js'
@@ -207,14 +207,19 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
       // scope unparseable later, so a request naming `docs/` could never be answered.
       const prohibited = prohibitionTargets(humanText)
       const targets = taskType === 'docs'
-        ? namedTargets(humanText).filter(t => !prohibited.some(p => sameNamedObject(p, t.norm)))
+        ? namedTargets(humanText).filter(t => !prohibited.some(p => prohibitionCoversTarget(p, t.norm)))
           .map(t => (t.dir ? `${t.norm}/` : t.norm))
         : []
+      const declared = declaredRequirements({ text: humanText, sourceRef: eventId, targets,
+        perTarget: taskType === 'docs', prohibited, baseDir: sessionCwd(session) })
       task = { ...task, task_id: existing?.task_id ?? randomUUID(),
         objective_revision: existing ? existing.objective_revision + 1 : 1, source_ref: eventId,
         scope: targets.length ? targets : task.scope,
-        requirements: declaredRequirements({ text: humanText, sourceRef: eventId, targets,
-          perTarget: taskType === 'docs', prohibited, baseDir: sessionCwd(session) }) }
+        requirements: declared.requirements,
+        // A prohibition that names no object is not host-checkable: it is kept in the contract so
+        // the ledger shows what the host could not represent, but it never becomes a requirement
+        // no evidence or repair could close.
+        unrepresentable_prohibitions: declared.unrepresentable_prohibitions }
       ledger.record(session.id, 'task.contract', task, { task_id: task.task_id, objective_revision: task.objective_revision })
       ledger.record(session.id, 'task.revision', { event_id: eventId, task_id: task.task_id, kind: 'user_revision',
         requirement_ids: task.requirements.map(r => r.requirement_id), source_ref: eventId, observed: true }, { task_id: task.task_id })

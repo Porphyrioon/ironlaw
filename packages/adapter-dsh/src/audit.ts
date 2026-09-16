@@ -25,6 +25,10 @@ export interface Requirement {
 export interface TaskContract {
   schema_version: 2; task_id: string; objective_revision: number; source_ref: string
   scope: string[]; requirements: Requirement[]; status: Verdict | 'active'
+  /** Prohibitions the request stated that name no object the host can check. Recorded for
+   * provenance only: they are not requirements, so nothing can be repaired into satisfying them,
+   * and they never excuse or block a verdict. */
+  unrepresentable_prohibitions?: string[]
 }
 export interface Candidate {
   claims_success: boolean
