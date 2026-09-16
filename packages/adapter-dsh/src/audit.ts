@@ -235,6 +235,9 @@ function guidance(missing: Array<{ missing_reason: string }>): string {
     verification_failed: 'The verification run failed. Fix the failure, re-run it, then report.',
     evidence_unknown: 'The verification outcome is indeterminate (no exit code, no assertion result). Re-run it so the host records a determinate outcome.',
     citation_unobserved: 'The delivery cites a source the host never observed, or cites none although the session consulted sources. Cite only URLs the host actually recorded (the ones your searches and fetches returned), the way the source was reached, then report.',
+    // Both the violated and the unverifiable prohibition land on this reason, so the guidance has
+    // to cover both without claiming which one happened: the check reference carries the detail.
+    hard_constraint_unconfirmed: 'A stated prohibition is not confirmed as respected: the host either observed a write to the named object, or cannot check that object at all. Leave the object as the request requires, re-run your verification, and report what the host saw; if it cannot be checked, say so plainly instead of claiming compliance.',
   }
   const lines = [...new Set(missing.map(m => byReason[m.missing_reason]).filter((line): line is string => !!line))]
   return lines.length ? lines.join(' ') : 'Supply current requirement-linked evidence or honestly report the remaining gap.'

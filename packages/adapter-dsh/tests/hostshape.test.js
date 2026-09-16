@@ -690,6 +690,8 @@ test('F3 an unresolvable prohibition stays pending review, not inapplicable', t 
     'the check names why it could not be decided')
   assert.ok(d.missing_requirements.some(m => m.missing_reason === 'hard_constraint_unconfirmed'),
     `an unconfirmable prohibition is listed for review: ${JSON.stringify(d.missing_requirements)}`)
+  assert.match(d.repair_action ?? '', /prohibition/i,
+    'the refusal must name the constraint it could not check')
 })
 
 test('F3 a same-named file in another directory is not a violation', t => {
@@ -775,6 +777,8 @@ test('F3 an unopenable prohibition still catches the write the host observed', t
   assert.notEqual(d.verdict, 'verified_complete', 'the write the host observed must break the stated prohibition')
   assert.ok(d.missing_requirements.some(m => m.missing_reason === 'hard_constraint_unconfirmed'),
     `expected the observed write to fail the hard item, got ${JSON.stringify(d.missing_requirements)}`)
+  assert.match(d.repair_action ?? '', /prohibition/i,
+    'a refusal has to say what it is about: the repair prompt named no constraint')
 })
 
 test('F3 a prohibited path is not also a deliverable', t => {
