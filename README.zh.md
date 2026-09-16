@@ -305,13 +305,13 @@ Hackathon 方案里讨论的铁律，不是再写一段更长的 system prompt�
 - **证据**：每个完整的 `tool.call` / `tool.result` 配对（用原生调用 ID 对齐）产生一条 `host_verifier` 证明。半配对、或来源为 model/summary 的记录，永不作为证明。
 - **请求声明的契约**：文档类请求点名了几个目标，就有几条验收项——点名 README 和 CHANGELOG 就必须两个都有，只写一个只满足其中一个。明确说出的禁止项（"不要改 config/"）变成一条 hard 项，携带它保护对象的指纹：文件取内容、目录取整棵树（有上限的遍历），宿主在裁决时重新读取并自己判断，而不是报"无法确认"；宿主**实际观察到**的、落在该名字下的写入即使最终字节没变也算违规。带目录成分的禁止项按段边界做路径后缀匹配，`config/app.yml` 不会被误判成 `other/app.yml`；只有裸名字才按 basename 比较，且检查引用会写明这一点。宿主无法解析或打开的禁止项既不判为已满足、也不判为不适用：按规范 §3 保持 `unknown` 并列为待核查，理由写在检查引用里。根本没点名对象的禁止项（"不要动代码"）记进契约的 `unrepresentable_prohibitions`，不会变成任何证据都无法收尾的需求。禁止项列了多个名字（"不要修改 A 和 B"）则每个名字都受保护；被禁止的目标也不会再被当成交付物——同一句话里既禁止改动又等待交付，会让两条需求互相矛盾，任何一轮都收不了尾。其它类型保持单条验收项——一次测试跑覆盖的是整个仓库，不是某个点名文件。
 - **退出码**：宿主的会话事件流本身**不带**结构化退出码。这一点是在真实 76 MB 账本上量出来的，不是假设：非空 `exit_code` 的记录 0 条，全文出现 `"exitCode"` 0 次，所有工具结果 `meta` 里带 `card` 字段的 0 条（真实 `meta` 是工具自己的结构化输出，例如读取文件的行内容）。退出码只存在于 `tools/result` 钩子拿到的规范化返回值里，因此适配器按原生调用 ID 落一条 `tool.outcome` 记录，resolver 从那里读数值退出码。没有数值退出码、或没有非空命令文本，证据就停在 `unknown`。
-- **相关性**：只有命令属于验证类调用（test/build/lint/typecheck 等运行器，保守白名单、失败关闭）且退出码未被屏蔽地到达宿主时，结果才作为验收证据。`echo`、`ls`、`cat` 与读取操作不能验证任何东西。屏蔽按**shell 方言**判定，方言取自被配对调用的工具名：POSIX 把 `||`、`;`、`|`、换行都算屏蔽；PowerShell 只把 `;`、`||`、换行算屏蔽，因为 PowerShell 的管道会保留底层退出码——用进程退出码实测：`cmd /c exit 3 | Select-Object -Last 1`、`cmd /c exit 3 | cat`、`cmd /c exit 3 | findstr x` 全都仍然报失败，而 `cmd /c exit 3; Write-Host hi` 返回 0。认不出的工具名按 POSIX（更严的那一种）处理。
+- **相关性**：只有命令属于验证类调用（test/build/lint/typecheck 等运行器，保守白名单、失败关闭）且退出码未被屏蔽地到达宿主时，结果才作为验收证据。`echo`、`ls`、`cat` 与读取操作不能验证任何东西。屏蔽按**shell 方言**判定，方言取自被配对调用的工具名：POSIX 把 `||`、`;`、`|`、`&`、换行都算屏蔽；PowerShell 把 `;`、`||`、`&`、换行算屏蔽（不算管道），因为 PowerShell 的管道会保留底层退出码——用进程退出码实测：`cmd /c exit 3 | Select-Object -Last 1`、`cmd /c exit 3 | cat`、`cmd /c exit 3 | findstr x` 全都仍然报失败，而 `cmd /c exit 3; Write-Host hi` 返回 0。后台执行的验证（`npm test &`）在两种方言下都算屏蔽：连接符立刻返回，它的退出状态说明不了工作是否完成。认不出的工具名按 POSIX（更严的那一种）处理。
 
 上下文治理是配套能力，见下一节。
 
 ### 验证
 
-monorepo 全量测试 238 项通过（adapter-dsh 219、cli 6、memory 13），`npm run typecheck` 干净。resolver 的形态由**四轮对抗探针**塑造——探针由非实现方编写并执行——外加一次真实账本审计：
+monorepo 全量测试 257 项通过（adapter-dsh 238、cli 6、memory 13），`npm run typecheck` 干净。resolver 的形态由**六轮对抗探针**塑造——探针由非实现方编写并执行——外加一次真实账本审计：
 
 - "无关命令"探针发现早期版本对"改文件 + 任意 exit-0 命令"就判 `verified_complete`；"退出码屏蔽"探针发现 `npm test || true` 在测试失败时也判 `verified_complete`。
 - "任务类型"探针发现第一版修复让一次无关文件写入满足了文档请求、`echo hello` 满足了部署、读一个本地文件满足了调研；第二版修复又让"回落到 code 证据"这条路径把文档请求交给了一个通过的测试套件收尾。以上路径现全部拦截并有测试覆盖。
@@ -438,7 +438,7 @@ ironlaw/
 └── packages/adapter-dsh/  # @ironlaw/adapter-dsh：DeepSeek Harness 原生 Cordis 插件
 ```
 
-目前 monorepo 全量测试 238 项通过（cli 6 + memory 13 + adapter-dsh 219）。这是协议、本地 sidecar 与 DSH 原生插件的证据，不代表所有宿主、所有版本、所有 Provider 或任何任务结果已经验收，也不构成对用户的交付保证。
+目前 monorepo 全量测试 257 项通过（cli 6 + memory 13 + adapter-dsh 238）。这是协议、本地 sidecar 与 DSH 原生插件的证据，不代表所有宿主、所有版本、所有 Provider 或任何任务结果已经验收，也不构成对用户的交付保证。
 
 ## 如何判断项目是否成功
 

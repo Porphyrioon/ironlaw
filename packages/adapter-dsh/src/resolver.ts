@@ -1170,7 +1170,7 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
   const responseSeq = (assistant?.payload as any)?.seq ?? -1
   return {
     request_id: `${ctx.session_id}:${ctx.turn}:${responseSeq}`,
-    task, candidate, candidate_check: candidateCheck, evidence, evidence_gaps: gaps,
+    task, task_type: taskType, candidate, candidate_check: candidateCheck, evidence, evidence_gaps: gaps,
     hard_constraints_checked: buildHardChecks(task, ctx),
     object_version_digest: objectDigest,
     context_state_digest: `dsh:${ctx.session_id}:turn:${ctx.turn}:events:${ctx.recovery.event_sequence}`,

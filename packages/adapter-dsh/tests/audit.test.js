@@ -1,4 +1,4 @@
-﻿import test from 'node:test'
+import test from 'node:test'
 import assert from 'node:assert/strict'
 import { auditTurn, MAX_REPAIRS } from '../lib/audit.js'
 export const task = () => ({ schema_version: 2, task_id: 't1', objective_revision: 1, source_ref: 'user:1', scope: ['code+tests+config+deps'], status: 'active', requirements: [{ requirement_id: 'AC-1', class: 'acceptance', source_kind: 'user_instruction', source_ref: 'user:1', applicability: 'applicable', status: 'pending' }] })
@@ -37,8 +37,7 @@ test('A07 later same-scope pass supersedes failure; unrelated error cannot poiso
   assert.equal(verdict(input({ evidence: [proof(), proof({ event_id: 'v2', status: 'failed' })] })), 'repair_required')
 })
 test('A08 exit zero with failed assertion is not verification', () => {
-  assert.equal(verdict(input({ evidence: [proof({ assertion_passed: false, exit_code: 0 })] })), 'repair_required')
-})
+  assert.equal(verdict(input({ evidence: [proof({ assertion_passed: false, exit_code: 0 })] })), 'repair_required')})
 test('A09 verified read-only sources and readable document satisfy content acceptance', () => {
   assert.equal(verdict(input({ evidence: [proof({ verifier_ref: 'document:sections+sources', requires_exit_code: false, exit_code: null })] })), 'verified_complete')
 })
@@ -109,4 +108,44 @@ test('environment, revision and unknown exit code are separately rejected', () =
   for (const patch of [{ environment_digest: 'other' }, { objective_revision: 2 }, { exit_code: null }]) {
     assert.equal(verdict(input({ evidence: [proof(patch)] })), 'repair_required')
   }
+})
+// R9 (sixth-round reviewers): the reason must describe the newest verification the host saw. An
+// earlier pass does not un-fail a later failure, and a run the host reported as failed is not the
+// same thing as no run at all.
+test('R9 the newest older run decides the reason, not any earlier pass', () => {
+  const passed = proof({ objective_revision: 0 })
+  const failedLater = proof({ event_id: 'v2', objective_revision: 0, status: 'failed', assertion_passed: false, exit_code: 1 })
+  const r = auditTurn(input({ task: { ...task(), objective_revision: 2 }, evidence: [passed, failedLater] }))
+  assert.equal(r.decision.verdict, 'repair_required')
+  assert.deepEqual(r.decision.missing_requirements, [{ requirement_id: 'AC-1', missing_reason: 'verification_failed' }])
+  assert.match(r.decision.repair_action, /run failed/i)
+})
+test('R9 a host-reported failure with no exit code is a failed run, not a missing one', () => {
+  const failedNoCode = proof({ objective_revision: 0, status: 'failed', assertion_passed: false, exit_code: null, requires_exit_code: false })
+  const r = auditTurn(input({ task: { ...task(), objective_revision: 2 }, evidence: [failedNoCode] }))
+  assert.deepEqual(r.decision.missing_requirements, [{ requirement_id: 'AC-1', missing_reason: 'verification_failed' }])
+})
+test('R9 a stale older run is still stale, and a passed one still superseded', () => {
+  const stale = proof({ objective_revision: 0, status: 'stale' })
+  assert.deepEqual(auditTurn(input({ task: { ...task(), objective_revision: 2 }, evidence: [stale] }))
+    .decision.missing_requirements, [{ requirement_id: 'AC-1', missing_reason: 'evidence_stale' }])
+  const passed = proof({ objective_revision: 0 })
+  assert.deepEqual(auditTurn(input({ task: { ...task(), objective_revision: 2 }, evidence: [passed] }))
+    .decision.missing_requirements, [{ requirement_id: 'AC-1', missing_reason: 'evidence_superseded' }])
+})
+test('R9 the missing-evidence guidance names the artifact the task type needs', () => {
+  const repair = type => auditTurn(input({ task: { ...task(), objective_revision: 2 }, task_type: type })).decision.repair_action
+  assert.match(repair('ops'), /operation entry point/i)
+  assert.match(repair('docs'), /document artifact/i)
+  assert.match(repair('research'), /source outside the workspace/i)
+  assert.match(repair('code'), /verification-class/i)
+})
+test('R9 a fallback reason still explains itself', () => {
+  const body = auditTurn(input({
+    candidate: { claims_success: false, response_kind: 'discussion', text: 'x', requirement_claims: [] },
+    candidate_check: { status: 'contradictory', source_ref: 'host:body-check' },
+  }))
+  assert.ok(body.decision.reason_codes.includes('candidate_contract_invalid'), JSON.stringify(body.decision.reason_codes))
+  assert.match(body.decision.repair_action ?? '', /not well formed/i,
+    'a reason with no specific line must still say something useful')
 })

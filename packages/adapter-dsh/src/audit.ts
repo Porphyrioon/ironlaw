@@ -69,6 +69,8 @@ export interface AuditState {
 }
 export interface AuditInput {
   request_id: string; task: TaskContract; candidate: Candidate
+  /** The task type the trusted resolver read, so the repair guidance names the right artifact. */
+  task_type?: string
   /** Independent host check against actual response text. Unknown fails closed. */
   candidate_check: { status: 'consistent' | 'contradictory' | 'unknown'; source_ref: string }
   evidence: Verification[]; hard_constraints_checked: HardConstraintCheck[]
@@ -139,27 +141,18 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
     const e = input.evidence.filter(e => e.task_id === task.task_id && e.objective_revision === task.objective_revision
       && e.requirement_ids.includes(r.requirement_id) && e.source_kind === 'host_verifier').at(-1)
     if (!e) {
-      // Distinguish "this revision was never verified" from "it was verified under an earlier
-      // task revision". The revision advances with every user message, so the second case is
-      // the common one in a live session, and its fix is to re-run the same command — not to
-      // invent new evidence. The task's own requirement set and the object digest still decide
-      // validity; only the reported reason and its guidance differ.
+      // The reason must describe the newest verification the host saw. An earlier pass does not
+      // un-fail a later failure, and a run the host reported as failed is not "no run at all" —
+      // both were reported wrongly before (found by the sixth-round reviewers). Only determinate
+      // proofs ever carry requirement ids, so the last entry is the newest one.
       const older = input.evidence.filter(v => v.task_id === task.task_id
         && v.objective_revision !== task.objective_revision
         && v.requirement_ids.includes(r.requirement_id) && v.source_kind === 'host_verifier')
-      const olderPassed = older.some(v => v.status === 'passed' && v.assertion_passed === true
-        && (typeof v.exit_code !== 'number' || v.exit_code === 0))
-      // The reason has to name what the host actually saw. A passing run whose captured files moved
-      // is stale evidence, not a failed run: reporting `verification_failed` sent the agent to fix
-      // a failure that never happened (found on a live session, 2026-09-16, in the 0.1.0 build).
-      // Older evidence that never ran a verification at all is not evidence of a failure either.
-      const olderStale = older.some(v => v.status === 'stale')
-      const olderFailed = older.some(v => v.status === 'failed' && v.requires_exit_code === true)
-      const reason = olderPassed ? 'evidence_superseded'
-        : olderStale ? 'evidence_stale'
-        : olderFailed ? 'verification_failed'
-        : 'evidence_missing'
-      add(r.requirement_id, reason)
+      const newest = older.at(-1)
+      add(r.requirement_id, !newest ? 'evidence_missing'
+        : newest.status === 'passed' ? 'evidence_superseded'
+        : newest.status === 'stale' ? 'evidence_stale'
+        : 'verification_failed')
       continue
     }
     if (!input.object_version_digest || !input.environment_digest || e.object_version_digest !== input.object_version_digest
@@ -205,7 +198,7 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
       || recoveries.some(e => e.kind === 'object_change' || e.kind === 'user_revision')
     if (state.repair_count < MAX_REPAIRS && newKeys.length && objectChangeVerified) {
       verdict = 'repair_required'; state.repair_count++; state.repair_keys.push(...keys)
-      repair = missing.map(m => `${m.requirement_id}: ${m.missing_reason}`).join('; ') + '. ' + guidance(missing)
+      repair = missing.map(m => `${m.requirement_id}: ${m.missing_reason}`).join('; ') + '. ' + guidance(missing, input.task_type)
     } else { verdict = 'incomplete'; reasons.push('repair_budget_exhausted_or_duplicate') }
   } else if (c.response_kind === 'incomplete_report' || c.response_kind === 'blocked_report') {
     verdict = 'incomplete'; if (c.response_kind === 'blocked_report') reasons.push('blocker_unconfirmed')
@@ -224,12 +217,22 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
  * What to do about each gap, in the order a reader needs it. A bare reason code says that
  * something is missing but not that the missing thing is a *re-run*: the common live case is a
  * passing verification whose task revision has since advanced, where the fix is to run the
- * same command again in the current revision. Reasons without specific guidance fall back to
- * the generic sentence, so the message never becomes misleadingly precise.
+ * same command again in the current revision.
+ *
+ * "No evidence" means a different artifact per task type (the sixth-round reviewers found the code
+ * wording handed to a deploy or a document task), so `evidence_missing` is chosen by the type the
+ * resolver read. Every other reason has its own line, and one that somehow has none still falls
+ * back to an honest generic sentence rather than a misleadingly precise one.
  */
-function guidance(missing: Array<{ missing_reason: string }>): string {
+function guidance(missing: Array<{ missing_reason: string }>, taskType?: string): string {
   const byReason: Record<string, string> = {
-    evidence_missing: 'No verification-class run is recorded for this task revision. Run the project\'s own verification (its test, build or lint command) as a single unmasked command so the host records its exit code, then report.',
+    evidence_missing: taskType === 'ops'
+      ? 'No operation entry point is recorded for this task revision. Run the real deploy/publish/restart command as a single unmasked command so the host records its exit code, then report.'
+      : taskType === 'docs'
+        ? 'No document artifact is recorded for this task revision. Write the document the request names, through a tool the host records, then report.'
+        : taskType === 'research'
+          ? 'No source outside the workspace is recorded for this task revision. Run the search or fetch the host can observe, cite the sources it returned, then report.'
+          : 'No verification-class run is recorded for this task revision. Run the project\'s own verification (its test, build or lint command) as a single unmasked command so the host records its exit code, then report.',
     evidence_superseded: 'A passing verification run exists but is bound to an earlier task revision — the revision advances with each user message, so earlier evidence cannot close this one. Re-run the same command in this revision, then report.',
     evidence_stale: 'The verification\'s object version no longer matches the current files, so it cannot speak for them. Re-run the verification after your last change, then report.',
     verification_failed: 'The verification run failed. Fix the failure, re-run it, then report.',
@@ -238,6 +241,9 @@ function guidance(missing: Array<{ missing_reason: string }>): string {
     // Both the violated and the unverifiable prohibition land on this reason, so the guidance has
     // to cover both without claiming which one happened: the check reference carries the detail.
     hard_constraint_unconfirmed: 'A stated prohibition is not confirmed as respected: the host either observed a write to the named object, or cannot check that object at all. Leave the object as the request requires, re-run your verification, and report what the host saw; if it cannot be checked, say so plainly instead of claiming compliance.',
+    applicability_unknown: 'A requirement could not be confirmed as applying to this task. Report which one, and what evidence would settle it, instead of assuming it away.',
+    task_contract_invalid: 'The task contract itself is not well formed, so nothing can be checked against it. Report the contract as recorded rather than retrying the work.',
+    candidate_contract_invalid: 'The claimed completion is not well formed (a missing flag, an illegal response kind, or body text that contradicts the recorded message). Restate it in the required shape, or report the gap honestly.',
   }
   const lines = [...new Set(missing.map(m => byReason[m.missing_reason]).filter((line): line is string => !!line))]
   return lines.length ? lines.join(' ') : 'Supply current requirement-linked evidence or honestly report the remaining gap.'
