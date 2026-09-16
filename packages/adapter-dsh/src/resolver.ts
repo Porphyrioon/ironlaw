@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto'
 import type { EvidenceLedger, EvidenceRecord } from './evidence.js'
 import { objectVersionDigest } from './fingerprint.js'
 import { classifyTaskType, isTaskType, hostReadable, type TaskType } from './classify.js'
+import { contentDigest } from './contract.js'
 import { SHELL_TOOL, readableRegularFiles, shellWriteTargets, snapshotHolds } from './snapshot.js'
-import type { AuditInput, Candidate, HardConstraintCheck, Status, TaskContract, Verification } from './audit.js'
+import type { AuditInput, Candidate, HardConstraintCheck, Requirement, Status, TaskContract, Verification } from './audit.js'
 
 /**
  * Trusted host integration boundary. Assembles the audit input from durable host
@@ -560,13 +561,14 @@ const PATH_TOKEN = /(?:[A-Za-z0-9_.@+\-]+[\\/])+[A-Za-z0-9_.@+\-]*[\\/]?|[A-Za-z
 const URL = /[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+|\bwww\.\S+/gi
 
 interface NamedTarget { norm: string; base: string; stem: string; dir: boolean }
+export type { NamedTarget }
 
 /**
  * The file and directory targets the human request names explicitly. URLs are dropped
  * whole first, so neither their host nor their path segments can be mistaken for a
  * target and reject every legitimate artifact.
  */
-function namedTargets(request: string): NamedTarget[] {
+export function namedTargets(request: string): NamedTarget[] {
   const text = request.replace(URL, ' ')
   const out: NamedTarget[] = []
   const add = (raw: string, dir: boolean): void => {
@@ -628,8 +630,8 @@ function answersDocsRequest(path: string, named: NamedTarget[]): boolean {
  * The proof comes from the host filesystem, never from the model saying "I wrote it".
  */
 function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
-  const ids = acceptanceIds(task), out: Verification[] = []
-  if (!ids.length) return out
+  const items = acceptanceItems(task), out: Verification[] = []
+  if (!items.length) return out
   const named = namedTargets(humanRequestText(ctx))
   const outcomes = outcomesByCallId(ctx)
   const versions = versionsByCallId(ctx)
@@ -650,6 +652,11 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
     if (shellWrote) for (const p of shellWriteTargets(command, dialectOf(callName))) candidates.push(p)
     const written = candidates.filter(p => hostReadable(p) && answersDocsRequest(p, named))
     if (!written.length) continue
+    // Bind each written artifact to the requirement it actually answers. Assigning every
+    // acceptance item to any artifact is what let a request naming README and CHANGELOG close
+    // on README alone.
+    const matched = items.filter(item => written.some(p => answersItem(p, item, named)))
+    if (!matched.length) continue
     // The document must still be the file the write captured; a later edit to it means this
     // proof no longer speaks for what is on disk, so it is kept and marked stale.
     const writeVersions = versions.get(c.tool_call_id ?? '') ?? {}
@@ -657,7 +664,7 @@ function buildDocsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectD
     out.push({
       event_id: `verify:${c.result.event_id}`, task_id: c.result.task_id ?? task.task_id,
       objective_revision: c.result.objective_revision ?? task.objective_revision,
-      requirement_ids: ids, object_version_digest: objectDigest,
+      requirement_ids: matched.map(item => item.requirement_id), object_version_digest: objectDigest,
       environment_digest: envDigest, object_versions: writeVersions, status: held ? 'passed' : 'stale',
       complete: true, source_kind: 'host_verifier',
       verifier_ref: `dsh-host:docs-artifact:${written[0]}`, output_ref: c.result.output_ref ?? c.result.event_id,
@@ -711,40 +718,58 @@ function lastExternalQuery(ctx: ResolveAuditContext): { ref: string; digest: str
   return found
 }
 
-/** One observed attempt at an operation entry point, successful or not. */
+/** One observed attempt at an operation entry point, successful or not — or not yet finished. */
 interface OpsAttempt {
   eventId: string; ref: string; cmd: string
+  /** The operation this attempt targets, normalized from its entry segment. */
+  target: string
   outcome: 'passed' | 'failed' | 'unknown'
   exit: number | null; digest: string; revision: number | null
 }
 
+/** The entry segment an operation attempts, normalized so the same operation groups together. */
+function opsTarget(cmd: string): string {
+  for (const segment of splitShellSegments(cmd).segs) {
+    const normalized = segment.trim().replace(LEAD_STRIP, '').trim()
+    if (normalized && runsOpsEntry(normalized)) return normalized.replace(/\s+/g, ' ').toLowerCase()
+  }
+  return cmd.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
 /**
- * Every observed attempt at an operation entry point, in durable order — **including the ones
- * the host reports as failed**. Collecting only usable successes and then claiming to take "the
- * latest attempt" was a lie: a later `isError` failure carries no numeric exit code, so it never
- * reached the collection and an earlier success survived it. The command text comes from the
- * call, not from the outcome, so an attempt is still identifiable when its result is a failure.
- * Noop commands and masked ones are dropped: they operate on nothing and cannot be attributed.
+ * Every observed attempt at an operation entry point, in durable order — including the ones the
+ * host reports as failed and the ones whose result has not arrived yet. Three ways of dropping
+ * an attempt each let an earlier success stand for work that had not happened:
+ *
+ * - collecting only usable successes (a later host-reported failure carries no exit code);
+ * - requiring a numeric exit code (a pending call has none);
+ * - dropping masked commands entirely, when the honest reading is "this attempt cannot be
+ *   confirmed", not "this attempt does not exist".
+ *
+ * Only a command that is not an entry point at all is ignored: it operates on nothing. The
+ * command text comes from the call, so an attempt stays identifiable without its result.
  */
 function opsAttempts(ctx: ResolveAuditContext): OpsAttempt[] {
   const out: OpsAttempt[] = []
   const outcomes = outcomesByCallId(ctx)
   const captured = digestsByCallId(ctx)
   for (const c of ctx.recovery.calls) {
-    if (!c.call || !c.result) continue
-    if (modelSourced(c.call) || modelSourced(c.result)) continue
+    if (!c.call) continue
+    if (modelSourced(c.call) || (c.result && modelSourced(c.result))) continue
     const callData = dataOf(c.call)
     const cmd = commandText(callData)
-    if (!cmd.trim()) continue
+    if (!cmd.trim() || !runsOpsEntry(cmd)) continue
     const dialect = dialectOf(callData.name)
-    if (hasMaskedExit(cmd, dialect) || !runsOpsEntry(cmd)) continue
-    const t = terminalOf(outcomes.get(c.tool_call_id))
-    const hostFailed = c.result.result_status === 'failed' || c.status === 'failed'
-    const outcome: OpsAttempt['outcome'] = hostFailed || (t && t.exit !== 0) ? 'failed' : t ? 'passed' : 'unknown'
+    const masked = hasMaskedExit(cmd, dialect)
+    const t = masked ? null : terminalOf(outcomes.get(c.tool_call_id))
+    const hostFailed = !!c.result && (c.result.result_status === 'failed' || c.status === 'failed')
+    const outcome: OpsAttempt['outcome'] = hostFailed || (t && t.exit !== 0) ? 'failed' : t && !masked ? 'passed' : 'unknown'
     out.push({
-      eventId: c.result.event_id, ref: c.result.output_ref ?? c.result.event_id, cmd, outcome,
-      exit: t ? t.exit : null, digest: t?.digest || captured.get(c.tool_call_id ?? '') || '',
-      revision: c.result.objective_revision ?? null,
+      eventId: c.result?.event_id ?? c.call.event_id,
+      ref: c.result?.output_ref ?? c.result?.event_id ?? c.call.event_id,
+      cmd, target: opsTarget(cmd), outcome, exit: t ? t.exit : null,
+      digest: t?.digest || captured.get(c.tool_call_id ?? '') || '',
+      revision: c.result?.objective_revision ?? null,
     })
   }
   return out
@@ -752,6 +777,23 @@ function opsAttempts(ctx: ResolveAuditContext): OpsAttempt[] {
 
 function acceptanceIds(task: TaskContract): string[] {
   return task.requirements.filter(r => r.class === 'acceptance' && r.applicability === 'applicable').map(r => r.requirement_id)
+}
+
+/** The applicable acceptance items themselves, so a template can bind evidence per item. */
+function acceptanceItems(task: TaskContract): Requirement[] {
+  return task.requirements.filter(r => r.class === 'acceptance' && r.applicability === 'applicable')
+}
+
+/**
+ * Whether a written artifact answers this requirement's declared target. An item with no target
+ * of its own keeps the older, coarser rule (any target the request named).
+ */
+function answersItem(path: string, item: Requirement, named: NamedTarget[]): boolean {
+  const scope = item.scope?.filter(Boolean) ?? []
+  if (!scope.length) return answersDocsRequest(path, named)
+  // answersTarget expects the normalized form every other comparison here uses.
+  const normalized = slashOf(path)
+  return namedTargets(scope.join(' ')).some(target => answersTarget(normalized, target))
 }
 
 /**
@@ -783,20 +825,25 @@ function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, obj
 
 /**
  * ops template: the actual entry point ran and the host observed a determinate, unmasked
- * exit 0. A masked (`|| true`, `;`, pipe), non-zero, or absent result is no proof, and
- * neither is a noop command (`echo`, `ls`, `cat`, ...) that exits 0 without operating on
- * anything. The LAST such attempt decides: an earlier success followed by a failure of the
- * same entry point must not read as success (spec §107), so the newest outcome is used and a
- * failing one simply yields no proof. The proof attests the object version captured at that
- * attempt and the revision it ran under.
+ * exit 0. A masked (`|| true`, `;`, pipe, background `&`), non-zero, absent or not-yet-arrived
+ * result is no proof, and neither is a noop command (`echo`, `ls`, `cat`, ...) that exits 0
+ * without operating on anything.
+ *
+ * The **newest attempt per target** decides, and every target the session attempted must be
+ * passing: an earlier success followed by a failure of the same entry point must not read as
+ * success (spec §107), and neither must a success on a different target stand in for a failed
+ * one. Comparing whole-command texts instead would let "deploy A" and "deploy B" pass for each
+ * other, so attempts are grouped by their entry segment.
  */
 function buildOpsEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
   const ids = acceptanceIds(task)
   const attempts = opsAttempts(ctx)
+  if (!ids.length || !attempts.length) return []
+  const latestByTarget = new Map<string, OpsAttempt>()
+  for (const attempt of attempts) latestByTarget.set(attempt.target, attempt)
+  if ([...latestByTarget.values()].some(attempt => attempt.outcome !== 'passed')) return []
   const latest = attempts.at(-1)
-  // The newest attempt decides. A later failure of the same entry point — including one the
-  // host reports as an error rather than as a non-zero exit — leaves no proof (spec §107).
-  if (!ids.length || !latest || latest.outcome !== 'passed') return []
+  if (!latest) return []
   // An operation's object is not a file set: this digest is derived from the observed outcomes
   // themselves, so it cannot silently track a later edit the way a file digest can.
   const digest = latest.digest || objectDigest
@@ -852,16 +899,23 @@ function objectDigestFor(type: TaskType, ctx: ResolveAuditContext): string {
 }
 
 /**
- * Hard constraints are listed one-by-one. The host cannot confirm compliance of
- * an arbitrary hard requirement from tool events alone, so each stays `unknown`
- * and fails closed (`hard_constraint_unconfirmed`) rather than being asserted
- * compliant without trusted proof.
+ * Hard constraints are listed one-by-one. A prohibition the host captured a baseline for can be
+ * checked by the host itself: it re-reads the protected object and compares. A hard item with no
+ * baseline stays `unknown` and fails closed (`hard_constraint_unconfirmed`) rather than being
+ * asserted compliant without trusted proof.
  */
 function buildHardChecks(task: TaskContract): HardConstraintCheck[] {
-  return task.requirements.filter(r => r.class === 'hard').map(r => ({
-    requirement_id: r.requirement_id, applicability: r.applicability,
-    status: 'unknown' as const, check_ref: `host:hard:${r.requirement_id}`,
-  }))
+  return task.requirements.filter(r => r.class === 'hard').map(r => {
+    const scope = r.scope?.[0]
+    if (!scope || !r.baseline_digest) return {
+      requirement_id: r.requirement_id, applicability: r.applicability,
+      status: 'unknown' as const, check_ref: `host:hard:${r.requirement_id}`,
+    }
+    const now = contentDigest(scope)
+    const status: HardConstraintCheck['status'] = !now ? 'unknown' : now === r.baseline_digest ? 'compliant' : 'violated'
+    return { requirement_id: r.requirement_id, applicability: r.applicability, status,
+      check_ref: `dsh-host:unchanged:${scope}` }
+  })
 }
 
 /**

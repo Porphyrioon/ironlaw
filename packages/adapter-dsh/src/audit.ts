@@ -120,7 +120,11 @@ export function auditTurn(input: AuditInput): { decision: Decision; state: Audit
       || checks[0].applicability !== 'applicable' || !checks[0].check_ref) add(r.requirement_id, 'hard_constraint_unconfirmed')
   }
   const unsafe = missing.length > 0
-  for (const r of requirements.filter(r => !excluded(r))) {
+  // Acceptance items only. A hard constraint is not an artifact to produce: it is checked by the
+  // host (`hard_constraints_checked`, above). Letting it through this loop demanded a
+  // host_verifier proof bound to it as well, which no host can supply, so any declared hard
+  // constraint made completion impossible.
+  for (const r of requirements.filter(r => r.class === 'acceptance' && !excluded(r))) {
     if (r.applicability !== 'applicable') { add(r.requirement_id, 'applicability_unknown'); continue }
     const e = input.evidence.filter(e => e.task_id === task.task_id && e.objective_revision === task.objective_revision
       && e.requirement_ids.includes(r.requirement_id) && e.source_kind === 'host_verifier').at(-1)

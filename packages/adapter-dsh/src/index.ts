@@ -6,8 +6,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { EvidenceLedger, type Association, type EvidenceRecord } from './evidence.js'
 import { destructiveReason } from './policy.js'
 import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
-import { defaultResolveAudit } from './resolver.js'
+import { defaultResolveAudit, namedTargets } from './resolver.js'
 import { classifyTaskType } from './classify.js'
+import { declaredRequirements } from './contract.js'
 import { snapshotObjectVersions, touchedPathsOf, versionDigestOf } from './snapshot.js'
 
 /**
@@ -177,16 +178,26 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
     // Only actual human messages revise the contract. Synthetic feedback retains provenance.
     if (event.type === 'user/message' && data.source?.kind === 'user') {
       const existing = ledger.task(session.id)
+      const humanText = (Array.isArray(data.content) ? data.content : [])
+        .filter((p: any) => p?.type === 'text').map((p: any) => p.text).join('\n')
+      // Host-side classification from the human request only; persisted per revision so the type
+      // is stable across turns and never re-derived from model output.
+      const taskType = classifyTaskType(humanText)
+      // A document request names deliverables, so each named target becomes its own acceptance
+      // item; other types keep one item, because a test run covers a repository rather than a
+      // named file. Stated prohibitions become hard items carrying the digest of what they
+      // protect, which is what makes them checkable by the host later.
+      // A trailing slash is what marks a directory target; dropping it here made the item's own
+      // scope unparseable later, so a request naming `docs/` could never be answered.
+      const targets = taskType === 'docs' ? namedTargets(humanText).map(t => (t.dir ? `${t.norm}/` : t.norm)) : []
       task = { ...task, task_id: existing?.task_id ?? randomUUID(),
-        objective_revision: existing ? existing.objective_revision + 1 : 1, source_ref: eventId }
+        objective_revision: existing ? existing.objective_revision + 1 : 1, source_ref: eventId,
+        scope: targets.length ? targets : task.scope,
+        requirements: declaredRequirements({ text: humanText, sourceRef: eventId, targets, perTarget: taskType === 'docs' }) }
       ledger.record(session.id, 'task.contract', task, { task_id: task.task_id, objective_revision: task.objective_revision })
       ledger.record(session.id, 'task.revision', { event_id: eventId, task_id: task.task_id, kind: 'user_revision',
         requirement_ids: task.requirements.map(r => r.requirement_id), source_ref: eventId, observed: true }, { task_id: task.task_id })
-      // Host-side classification from the human request only; persisted per revision so
-      // the type is stable across turns and never re-derived from model output.
-      const humanText = (Array.isArray(data.content) ? data.content : [])
-        .filter((p: any) => p?.type === 'text').map((p: any) => p.text).join('\n')
-      const classification = { task_type: classifyTaskType(humanText), source_ref: eventId, observed: true }
+      const classification = { task_type: taskType, source_ref: eventId, observed: true }
       const classificationLink = { task_id: task.task_id, objective_revision: task.objective_revision }
       recordDerived(session.id, 'task.classification', classification,
         { ...classificationLink, event_id: versionedId(`${eventId}:classification`, classification, classificationLink) })

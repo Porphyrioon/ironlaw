@@ -487,6 +487,107 @@ test('T6b a change to a captured file does invalidate the run', t => {
   assert.deepEqual(d.missing_requirements.map(m => m.missing_reason), ['evidence_stale'])
 })
 
+// T3 (third review): three ways of dropping an attempt each let an earlier success stand for
+// work that had not happened — a call whose result never arrived, a masked retry that cannot be
+// confirmed, and a different target entirely.
+test('T3 an operation whose result never arrived is not success', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '部署到生产环境')
+  shell(h, 'd1', './deploy.sh prod', 0, 2, 3)
+  h.emit('tool/call', { turn: 1, callId: 'd2', name: 'pwsh', arguments: JSON.stringify({ command: './deploy.sh prod' }) }, 4)
+  assistant(h, '已部署。', 5)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete', 'a pending attempt cannot be assumed to have succeeded')
+})
+
+test('T3 a masked retry of the same operation is not success', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '部署到生产环境')
+  shell(h, 'd1', './deploy.sh prod', 0, 2, 3)
+  shell(h, 'd2', './deploy.sh prod || true', 0, 4, 5)
+  assistant(h, '已部署。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete',
+    'an attempt that cannot be confirmed must not vanish')
+})
+
+test('T3 a success on another target does not stand in for a failed one', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '部署到生产环境')
+  shell(h, 'd1', './deploy.sh A', 1, 2, 3)
+  shell(h, 'd2', './deploy.sh B', 0, 4, 5)
+  assistant(h, '已部署。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete', 'B did not deploy A')
+})
+
+test('T3 two targets that both pass still verify', t => {
+  const root = fixture(t), h = host(root)
+  user(h, '部署到生产环境')
+  shell(h, 'd1', './deploy.sh A', 0, 2, 3)
+  shell(h, 'd2', './deploy.sh B', 0, 4, 5)
+  assistant(h, '已部署。', 6)
+  h.stop(1)
+  assert.equal(decision(root).verdict, 'verified_complete')
+})
+
+// F3 (third review #10): a request that names two documents declares two acceptance items, so
+// producing one of them closes exactly one. The old contract had a single placeholder item and
+// assigned it to any artifact, which is why README alone used to pass.
+test('F3 a request naming two documents needs both', t => {
+  const one = fixture(t), readme = join(one, 'README.md'), changelog = join(one, 'CHANGELOG.md')
+  writeFileSync(readme, '# R\n'); writeFileSync(changelog, '# C\n')
+  const h1 = host(one)
+  user(h1, '更新 README.md 和 CHANGELOG.md 文档')
+  edit(h1, 'w1', readme, 2, 3)
+  assistant(h1, '都更新了。', 4)
+  h1.stop(1)
+  const d1 = decision(one)
+  assert.notEqual(d1.verdict, 'verified_complete', 'README alone must not answer a two-target request')
+  assert.ok(d1.missing_requirements.some(m => m.missing_reason === 'evidence_missing'))
+
+  const both = fixture(t), r2 = join(both, 'README.md'), c2 = join(both, 'CHANGELOG.md')
+  writeFileSync(r2, '# R\n'); writeFileSync(c2, '# C\n')
+  const h2 = host(both)
+  user(h2, '更新 README.md 和 CHANGELOG.md 文档')
+  edit(h2, 'w1', r2, 2, 3)
+  edit(h2, 'w2', c2, 4, 5)
+  assistant(h2, '都更新了。', 6)
+  h2.stop(1)
+  assert.equal(decision(both).verdict, 'verified_complete', 'both documents answer both items')
+})
+
+// F3 (third review #11): a stated prohibition becomes a hard item carrying the digest of what it
+// protects, so the host can check it itself instead of reporting it as unconfirmable. The
+// absolute path is what makes the baseline readable, the same limitation shell writes have.
+test('F3 a stated prohibition is checked by the host', t => {
+  const violated = fixture(t), protect = join(violated, 'protected.txt'), code = join(violated, 'login.js')
+  writeFileSync(protect, 'do not touch\n'); writeFileSync(code, 'a\n')
+  const h1 = host(violated)
+  user(h1, `不要修改 ${protect}，然后修复 login.js 并跑测试`)
+  writeFileSync(protect, 'CHANGED\n')
+  edit(h1, 'e1', code, 2, 3)
+  shell(h1, 'v1', 'npm test', 0, 4, 5)
+  assistant(h1, '已修复并验证。', 6)
+  h1.stop(1)
+  const d1 = decision(violated)
+  assert.notEqual(d1.verdict, 'verified_complete', 'a violated prohibition must block')
+  assert.ok(d1.missing_requirements.some(m => m.missing_reason === 'hard_constraint_unconfirmed'),
+    `expected the hard item to fail, got ${JSON.stringify(d1.missing_requirements)}`)
+
+  const kept = fixture(t), protect2 = join(kept, 'protected.txt'), code2 = join(kept, 'login.js')
+  writeFileSync(protect2, 'do not touch\n'); writeFileSync(code2, 'a\n')
+  const h2 = host(kept)
+  user(h2, `不要修改 ${protect2}，然后修复 login.js 并跑测试`)
+  edit(h2, 'e1', code2, 2, 3)
+  shell(h2, 'v1', 'npm test', 0, 4, 5)
+  assistant(h2, '已修复并验证。', 6)
+  h2.stop(1)
+  const dc = decision(kept)
+  assert.equal(dc.verdict, 'verified_complete',
+    `an untouched prohibition is compliant: ${JSON.stringify(dc.missing_requirements)}`)
+})
+
 // The non-shell templates keep working on the real shapes.
 test('G docs: a real edit with card-free diffs meta still verifies', t => {  const root = fixture(t), readme = join(root, 'README.md'); writeFileSync(readme, '# Title\n')
   const h = host(root)
