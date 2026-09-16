@@ -20,9 +20,9 @@ import { apply } from '@ironlaw/adapter-dsh'
 
 const fixture = t => { const root = mkdtempSync(join(tmpdir(), 'ironlaw-hs-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root }
 
-function host(root) {
+function host(root, extra = {}) {
   const handlers = new Map(), prompts = []
-  const session = { id: 'session' }
+  const session = { id: 'session', ...extra }
   apply({ on(name, fn) { handlers.set(name, fn) }, tools: { guard() {} } }, { evidenceRoot: root })
   return {
     prompts,
@@ -586,6 +586,105 @@ test('F3 a stated prohibition is checked by the host', t => {
   const dc = decision(kept)
   assert.equal(dc.verdict, 'verified_complete',
     `an untouched prohibition is compliant: ${JSON.stringify(dc.missing_requirements)}`)
+})
+
+// F3 follow-up: a prohibition must never become an item no turn can satisfy. The host can only
+// check an object it can open; when it cannot, it either sees the write itself or says so.
+test('F3 a prohibition the host cannot open is excluded, not a permanent block', t => {
+  const root = fixture(t), readme = join(root, 'README.md')
+  writeFileSync(readme, '# Title\n')
+  const h = host(root)
+  user(h, '不要动代码，只更新 README.md 文档')
+  edit(h, 'w1', readme, 2, 3)
+  assistant(h, '只改了 README。', 4)
+  h.stop(1)
+  const d = decision(root)
+  assert.ok(!d.missing_requirements.some(m => m.missing_reason === 'hard_constraint_unconfirmed'),
+    `a phrase that names no file must not block forever: ${JSON.stringify(d.missing_requirements)}`)
+  assert.equal(d.verdict, 'verified_complete')
+})
+
+test('F3 an unopenable prohibition still catches the write the host observed', t => {
+  const root = fixture(t), protect = join(root, 'unopenable-7c41.txt'), code = join(root, 'login.js')
+  writeFileSync(protect, 'do not touch\n'); writeFileSync(code, 'a\n')
+  const h = host(root) // no cwd on the session: the relative name cannot be resolved
+  user(h, '修复 login.js 的 bug 并跑测试，禁止修改 unopenable-7c41.txt')
+  writeFileSync(protect, 'CHANGED\n')
+  edit(h, 'e1', protect, 2, 3)
+  edit(h, 'e2', code, 4, 5)
+  shell(h, 'v1', 'npm test', 0, 6, 7)
+  assistant(h, '已修复。', 8)
+  h.stop(1)
+  const d = decision(root)
+  const check = d.hard_constraints_checked.find(c => c.requirement_id === 'HC-1')
+  assert.equal(check?.status, 'violated',
+    `the observed write is the violation the host can see: ${JSON.stringify(d.hard_constraints_checked)}`)
+  assert.match(check.check_ref, /observed-write/,
+    'the check must name the write it observed, not a digest it never had')
+  assert.notEqual(d.verdict, 'verified_complete', 'the write the host observed must break the stated prohibition')
+  assert.ok(d.missing_requirements.some(m => m.missing_reason === 'hard_constraint_unconfirmed'),
+    `expected the observed write to fail the hard item, got ${JSON.stringify(d.missing_requirements)}`)
+})
+
+test('F3 a prohibited path is not also a deliverable', t => {
+  const root = fixture(t), keep = join(root, 'keep.txt'), readme = join(root, 'README.md')
+  writeFileSync(keep, 'do not touch\n'); writeFileSync(readme, '# Title\n')
+  const h = host(root)
+  user(h, `不要修改 ${keep}，更新 README.md 文档`)
+  edit(h, 'w1', readme, 2, 3)
+  assistant(h, '已更新。', 4)
+  h.stop(1)
+  const task = ledger(root).task('session')
+  assert.ok(!task.requirements.some(r => r.class === 'acceptance'
+    && (r.scope ?? []).some(s => s.toLowerCase().includes('keep.txt'))),
+  `an object the request forbids changing cannot also be a document it is waiting for: ${JSON.stringify(task.requirements)}`)
+  assert.equal(decision(root).verdict, 'verified_complete')
+})
+
+test('F3 a prohibition naming a list protects every name in it', t => {
+  const root = fixture(t), a = join(root, 'alpha.txt'), b = join(root, 'beta.txt'), readme = join(root, 'README.md')
+  for (const [p, text] of [[a, 'a\n'], [b, 'b\n'], [readme, '# Title\n']]) writeFileSync(p, text)
+  const h = host(root)
+  user(h, '不要修改 alpha.txt 和 beta.txt，更新 README.md 文档')
+  edit(h, 'e1', a, 2, 3)
+  edit(h, 'e2', readme, 4, 5)
+  assistant(h, '已更新。', 6)
+  h.stop(1)
+  const task = ledger(root).task('session')
+  const scopes = task.requirements.filter(r => r.class === 'acceptance').flatMap(r => r.scope ?? [])
+  assert.ok(!scopes.some(s => /alpha|beta/.test(s)),
+    `a name inside the prohibition is not a deliverable: ${JSON.stringify(task.requirements)}`)
+  assert.notEqual(decision(root).verdict, 'verified_complete',
+    'the second name in the list is protected too, and the host saw alpha.txt change')
+})
+
+test('F3 a relative prohibition resolves against the session working directory', t => {
+  const root = fixture(t), readme = join(root, 'README.md')
+  writeFileSync(readme, '# Title\n'); writeFileSync(join(root, 'protected.txt'), 'do not touch\n')
+  const h = host(root, { cwd: root })
+  user(h, '不要修改 protected.txt，更新 README.md 文档')
+  writeFileSync(join(root, 'protected.txt'), 'CHANGED\n')
+  edit(h, 'w1', readme, 2, 3)
+  assistant(h, '已更新。', 4)
+  h.stop(1)
+  const d = decision(root)
+  assert.notEqual(d.verdict, 'verified_complete',
+    'with the working directory known, the protected object is checked by digest')
+})
+
+test('F3 an English prohibition keeps the extension it names', t => {
+  const root = fixture(t), protect = join(root, 'notes.md'), code = join(root, 'login.js')
+  writeFileSync(protect, 'n\n'); writeFileSync(code, 'a\n')
+  const h = host(root)
+  user(h, 'Fix the login bug in login.js and run the tests. Do not modify notes.md.')
+  edit(h, 'e1', protect, 2, 3)
+  edit(h, 'e2', code, 4, 5)
+  shell(h, 'v1', 'npm test', 0, 6, 7)
+  assistant(h, 'Fixed.', 8)
+  h.stop(1)
+  const check = decision(root).hard_constraints_checked.find(c => c.requirement_id === 'HC-1')
+  assert.equal(check?.status, 'violated',
+    `a captured name must keep its extension: ${JSON.stringify(decision(root).hard_constraints_checked)}`)
 })
 
 // The non-shell templates keep working on the real shapes.

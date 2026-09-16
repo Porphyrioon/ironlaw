@@ -53,6 +53,19 @@ const stemOf = (base: string): string => base.replace(/\.[^.]+$/, '')
 /** Forward slashes and lowercase, the form every path comparison here uses. */
 const slashOf = (path: string): string => path.replace(/\\/g, '/').toLowerCase()
 
+/**
+ * Does a stated prohibition name the same object as a target the request names? Compared on the
+ * normalized path or the basename, because a request may say `protected.txt` where the session
+ * would open `D:\proj\protected.txt`. The deliverable list excludes prohibited objects: a path
+ * the human forbade changing cannot also be a document they are waiting for, and keeping both
+ * made the two requirements contradict each other so no turn could ever close.
+ */
+export function sameNamedObject(a: string, b: string): boolean {
+  const na = slashOf(a).replace(/\/+$/, ''), nb = slashOf(b).replace(/\/+$/, '')
+  if (!na || !nb) return false
+  return na === nb || baseName(na) === baseName(nb)
+}
+
 /** Shell tools whose command text can name a file they wrote. */
 /**
  * Affected paths: DSH diff metas (mutations report `card:'diff'` with `diffs[].path`),
@@ -899,17 +912,79 @@ function objectDigestFor(type: TaskType, ctx: ResolveAuditContext): string {
 }
 
 /**
- * Hard constraints are listed one-by-one. A prohibition the host captured a baseline for can be
- * checked by the host itself: it re-reads the protected object and compares. A hard item with no
- * baseline stays `unknown` and fails closed (`hard_constraint_unconfirmed`) rather than being
- * asserted compliant without trusted proof.
+ * The paths this revision actually wrote: writer-tool arguments, diff metadata and shell write
+ * targets. Reads are excluded on purpose — opening the protected file is not changing it, and
+ * counting reads turned every inspection of it into a violation.
  */
-function buildHardChecks(task: TaskContract): HardConstraintCheck[] {
+function writtenPaths(records: EvidenceRecord[]): string[] {
+  const paths = new Set<string>()
+  for (const r of records) {
+    const data = dataOf(r)
+    const meta = data?.meta
+    if (r.type === 'tool.result') {
+      if (Array.isArray(meta?.diffs))
+        for (const d of meta.diffs) if (typeof d?.path === 'string') paths.add(d.path)
+      if (Array.isArray(meta?.locations))
+        for (const l of meta.locations) if (typeof l?.path === 'string') paths.add(l.path)
+    }
+    if (r.type !== 'tool.call') continue
+    const name = typeof data?.name === 'string' ? data.name : ''
+    if (SHELL_TOOL.test(name)) {
+      for (const target of shellWriteTargets(commandText(data), dialectOf(name))) paths.add(target)
+      continue
+    }
+    if (!WRITE_TOOL.test(name) || typeof data.arguments !== 'string') continue
+    try {
+      const args = JSON.parse(data.arguments)
+      for (const k of ['path', 'file_path', 'filePath', 'target', 'filename', 'file'])
+        if (typeof args?.[k] === 'string') paths.add(args[k])
+    } catch { /* unparsed arguments carry no reliable path */ }
+  }
+  return [...paths]
+}
+
+/**
+ * Classify the prohibitions whose object the host cannot read. A stated prohibition must not
+ * disappear, and it must not become an item no turn can ever satisfy either: an item whose
+ * baseline is unreadable and which no observed write touches is excluded by host authority,
+ * with the reason recorded, so the gate says "outside my reach" instead of blocking forever.
+ * If the revision did write an object with that name, the prohibition stays applicable and the
+ * check below reports the violation.
+ */
+function withCheckableProhibitions(task: TaskContract, ctx: ResolveAuditContext): TaskContract {
+  const written = writtenPaths(ctx.records)
+  const requirements = task.requirements.map(r => {
+    if (r.class !== 'hard' || r.baseline_digest || !r.scope?.[0]) return r
+    const named = baseName(r.scope[0])
+    const hit = written.some(p => baseName(p) === named)
+    return hit ? { ...r, applicability: 'applicable' as const } : {
+      ...r, applicability: 'not_applicable' as const,
+      exclusion: { authorized: true, source_ref: r.source_ref,
+        reason: `the host cannot open ${r.scope[0]}, and no observed write names it` },
+    }
+  })
+  return { ...task, requirements }
+}
+
+/**
+ * Hard constraints are listed one-by-one. A prohibition the host captured a baseline for can be
+ * checked by the host itself: it re-reads the protected object and compares. One whose object it
+ * cannot open is checked against the writes the host actually observed, and otherwise stays an
+ * authorized exclusion rather than a permanently unconfirmable requirement. A hard item with
+ * neither a baseline nor an exclusion stays `unknown` and fails closed
+ * (`hard_constraint_unconfirmed`) rather than being asserted compliant without trusted proof.
+ */
+function buildHardChecks(task: TaskContract, ctx: ResolveAuditContext): HardConstraintCheck[] {
+  const written = writtenPaths(ctx.records)
   return task.requirements.filter(r => r.class === 'hard').map(r => {
     const scope = r.scope?.[0]
-    if (!scope || !r.baseline_digest) return {
-      requirement_id: r.requirement_id, applicability: r.applicability,
-      status: 'unknown' as const, check_ref: `host:hard:${r.requirement_id}`,
+    if (!scope || !r.baseline_digest) {
+      const named = scope ? baseName(scope) : ''
+      const hit = named ? written.find(p => baseName(p) === named) : undefined
+      if (hit) return { requirement_id: r.requirement_id, applicability: 'applicable' as const,
+        status: 'violated' as const, check_ref: `dsh-host:observed-write:${slashOf(hit)}` }
+      return { requirement_id: r.requirement_id, applicability: r.applicability,
+        status: 'unknown' as const, check_ref: `host:hard:${r.requirement_id}` }
     }
     const now = contentDigest(scope)
     const status: HardConstraintCheck['status'] = !now ? 'unknown' : now === r.baseline_digest ? 'compliant' : 'violated'
@@ -980,11 +1055,14 @@ export function defaultResolveAudit(ctx: ResolveAuditContext): Omit<AuditInput, 
   // blocker's evidence_ref): an id is only ever written once, under one object version.
   evidence = evidence.map(proofVersionId)
 
+  // A prohibition the host cannot open is either broken by an observed write or excluded by
+  // host authority; the returned task carries that classification into the audit.
+  task = withCheckableProhibitions(task, ctx)
   const responseSeq = (assistant?.payload as any)?.seq ?? -1
   return {
     request_id: `${ctx.session_id}:${ctx.turn}:${responseSeq}`,
     task, candidate, candidate_check: candidateCheck, evidence,
-    hard_constraints_checked: buildHardChecks(task),
+    hard_constraints_checked: buildHardChecks(task, ctx),
     object_version_digest: objectDigest,
     context_state_digest: `dsh:${ctx.session_id}:turn:${ctx.turn}:events:${ctx.recovery.event_sequence}`,
     environment_digest: envDigest, now: Date.now(),

@@ -6,9 +6,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { EvidenceLedger, type Association, type EvidenceRecord } from './evidence.js'
 import { destructiveReason } from './policy.js'
 import { auditTurn, repairPrompt, type AuditInput, type TaskContract } from './audit.js'
-import { defaultResolveAudit, namedTargets } from './resolver.js'
+import { defaultResolveAudit, namedTargets, sameNamedObject } from './resolver.js'
 import { classifyTaskType } from './classify.js'
-import { declaredRequirements } from './contract.js'
+import { declaredRequirements, prohibitionTargets, withoutProhibitions } from './contract.js'
 import { snapshotObjectVersions, touchedPathsOf, versionDigestOf } from './snapshot.js'
 
 /**
@@ -53,6 +53,16 @@ export interface IronLawConfig {
 function sessionIdOf(agent: { session?: { id?: unknown } } | undefined): string {
   const id = agent?.session?.id
   return typeof id === 'string' ? id : 'unknown'
+}
+/**
+ * The session's working directory, when the host exposes one. A request that names a relative
+ * path can only be opened after it is resolved against this. The field is optional in the host
+ * types, so its absence is normal and the caller falls back to observed writes.
+ */
+function sessionCwd(session: unknown): string {
+  const s = session as { cwd?: unknown; meta?: { cwd?: unknown } } | undefined
+  if (typeof s?.cwd === 'string') return s.cwd
+  return typeof s?.meta?.cwd === 'string' ? s.meta.cwd : ''
 }
 /**
  * Exit code from a canonical tool result value. DSH keeps that value execution-local
@@ -182,18 +192,29 @@ export function apply(ctx: Context, config: IronLawConfig = {}): void {
         .filter((p: any) => p?.type === 'text').map((p: any) => p.text).join('\n')
       // Host-side classification from the human request only; persisted per revision so the type
       // is stable across turns and never re-derived from model output.
-      const taskType = classifyTaskType(humanText)
+      // The prohibition clause says what must NOT change, so it does not decide what the work
+      // is: 「不要动代码，只更新 README.md 文档」 is a documentation request. A request that is
+      // nothing but a prohibition keeps its own text, so the type still comes from the request.
+      const work = withoutProhibitions(humanText)
+      const taskType = classifyTaskType(work.trim() ? work : humanText)
       // A document request names deliverables, so each named target becomes its own acceptance
       // item; other types keep one item, because a test run covers a repository rather than a
       // named file. Stated prohibitions become hard items carrying the digest of what they
       // protect, which is what makes them checkable by the host later.
+      // A path the request forbids changing is not one of its deliverables: keeping it in both
+      // lists created two requirements that contradicted each other, so no turn could close.
       // A trailing slash is what marks a directory target; dropping it here made the item's own
       // scope unparseable later, so a request naming `docs/` could never be answered.
-      const targets = taskType === 'docs' ? namedTargets(humanText).map(t => (t.dir ? `${t.norm}/` : t.norm)) : []
+      const prohibited = prohibitionTargets(humanText)
+      const targets = taskType === 'docs'
+        ? namedTargets(humanText).filter(t => !prohibited.some(p => sameNamedObject(p, t.norm)))
+          .map(t => (t.dir ? `${t.norm}/` : t.norm))
+        : []
       task = { ...task, task_id: existing?.task_id ?? randomUUID(),
         objective_revision: existing ? existing.objective_revision + 1 : 1, source_ref: eventId,
         scope: targets.length ? targets : task.scope,
-        requirements: declaredRequirements({ text: humanText, sourceRef: eventId, targets, perTarget: taskType === 'docs' }) }
+        requirements: declaredRequirements({ text: humanText, sourceRef: eventId, targets,
+          perTarget: taskType === 'docs', prohibited, baseDir: sessionCwd(session) }) }
       ledger.record(session.id, 'task.contract', task, { task_id: task.task_id, objective_revision: task.objective_revision })
       ledger.record(session.id, 'task.revision', { event_id: eventId, task_id: task.task_id, kind: 'user_revision',
         requirement_ids: task.requirements.map(r => r.requirement_id), source_ref: eventId, observed: true }, { task_id: task.task_id })
