@@ -124,8 +124,13 @@ function commandText(callData: any): string {
   return ''
 }
 
-/** Shell control operators, longest-first so `&&`/`||` are not split into `&`/`|`. */
-const SHELL_OPS = /&&|\|\||[;|\n]/g
+/**
+ * Shell control operators, longest-first so `&&`/`||` are not split into `&`/`|`. A single `&`
+ * is a connector too: it backgrounds what precedes it, so the host's exit code reports that the
+ * launch succeeded, not that the command finished. `>&` and `&1` are redirections, not
+ * backgrounding, and are left alone.
+ */
+const SHELL_OPS = /(?:&&|\|\||[;|\n]|(?<!>)&(?![&\d<>]))/g
 /** Shell dialect, decided by the tool that ran the command. */
 type ShellDialect = 'posix' | 'powershell'
 /** PowerShell tool names; every other name is read as POSIX. */
@@ -152,11 +157,13 @@ function dialectOf(toolName: unknown): ShellDialect {
  * POSIX only, and `;` masks in both.
  *
  * `&&` is absent from both: a failure short-circuits and propagates. `2>&1` is a
- * redirection, not a connector, and SHELL_OPS never splits on it.
+ * redirection, not a connector, and SHELL_OPS never splits on it. A single `&` masks in both
+ * dialects: it backgrounds the command, so the recorded exit code is the launch's, not the
+ * operation's, and an exit 0 there says nothing about whether the work finished.
  */
 const MASKING_CONN: Record<ShellDialect, ReadonlySet<string>> = {
-  posix: new Set(['||', ';', '|', '\n']),
-  powershell: new Set([';', '||', '\n']),
+  posix: new Set(['||', ';', '|', '\n', '&']),
+  powershell: new Set([';', '||', '\n', '&']),
 }
 /** Split a command line into segments and the connector that joins each pair. */
 function splitShellSegments(cmd: string): { segs: string[]; conns: string[] } {
@@ -203,7 +210,7 @@ const VERIFIER_PATTERNS: RegExp[] = [
  * false. `&&` neighbours are kept: a failure short-circuits and propagates.
  */
 /** A verifier asked for its own help or version runs nothing, whatever its exit code says. */
-const HELP_OR_VERSION = /(?:^|\s)(?:--help|-h|--version|-V|-v)(?:\s|$)/
+const HELP_OR_VERSION = /(?:^|\s)(?:--help|-h|--version|-V|-v)(?:=|\s|$)/
 
 function isTrustworthyVerification(cmd: string, dialect: ShellDialect): boolean {
   if (!cmd || !cmd.trim()) return false
@@ -644,19 +651,38 @@ function recordedDelivery(ctx: ResolveAuditContext): { ref: string; text: string
 }
 
 /**
+ * The delivery a query answers: the first assistant message recorded **after** that query — in
+ * practice the reply of the turn the search belonged to. Taking the latest delivery instead let
+ * an old search be re-stamped with a later reply, so the proof claimed the new answer was backed
+ * by the old source. Falls back to the latest delivery when there is no query to anchor to.
+ */
+function deliveryForQuery(ctx: ResolveAuditContext, query: { seq: number | null } | null): { ref: string; text: string } | null {
+  if (!query || query.seq === null) return recordedDelivery(ctx)
+  for (const r of ctx.records) {
+    if (r.type !== 'session.assistant/message') continue
+    const seq = (r.payload as any)?.seq
+    if (typeof seq !== 'number' || seq <= query.seq) continue
+    const text = assistantText(r.payload)
+    if (text.trim()) return { ref: r.event_id, text }
+  }
+  return null
+}
+
+/**
  * The most recent host-observed query to a source outside the workspace, together with the
  * object version captured at that query and the revision it ran under. Returning the capture
  * rather than a bare boolean is what lets a research proof speak for the moment it was made.
  */
-function lastExternalQuery(ctx: ResolveAuditContext): { ref: string; digest: string; revision: number | null } | null {
+function lastExternalQuery(ctx: ResolveAuditContext): { ref: string; digest: string; revision: number | null; seq: number | null } | null {
   const captured = digestsByCallId(ctx)
-  let found: { ref: string; digest: string; revision: number | null } | null = null
+  let found: { ref: string; digest: string; revision: number | null; seq: number | null } | null = null
   for (const c of ctx.recovery.calls) {
     if (!hostOk(c)) continue
     const name = dataOf(c.call).name
     if (typeof name !== 'string' || !EXTERNAL_SOURCE_TOOL.test(name)) continue
+    const seq = (c.result.payload as any)?.seq
     found = { ref: c.result.event_id, digest: captured.get(c.tool_call_id ?? '') ?? '',
-      revision: c.result.objective_revision ?? null }
+      revision: c.result.objective_revision ?? null, seq: typeof seq === 'number' ? seq : null }
   }
   return found
 }
@@ -714,11 +740,11 @@ function acceptanceIds(task: TaskContract): string[] {
  */
 function buildResearchEvidence(ctx: ResolveAuditContext, task: TaskContract, objectDigest: string, envDigest: string): Verification[] {
   const ids = acceptanceIds(task)
-  const delivery = recordedDelivery(ctx)
   const query = lastExternalQuery(ctx)
+  const delivery = deliveryForQuery(ctx, query)
   if (!ids.length || !delivery || !query) return []
-  // Research's object is the delivered content, not a file set: the digest is derived from the
-  // delivery event itself and does not move with the working tree.
+  // Research's object is the delivered content tied to that query, not a file set: the digest is
+  // derived from the delivery itself and does not move with the working tree.
   const digest = query.digest || objectDigest
   if (!digest) return []
   return [{
@@ -775,16 +801,30 @@ function discussionTask(task: TaskContract, ctx: ResolveAuditContext): TaskContr
 }
 
 /**
- * Object digest by type. File scope when files were touched; for research/ops the
- * verified object is the delivered content / observed outcome, so fall back to a
- * digest of that (keeps the proof's digest non-empty and equal to the input's).
+ * The object version a task of this type can be certified against. Each type has exactly ONE
+ * object domain, and a proof may only ever carry the digest of its own domain:
+ *
+ * - code / docs / discussion attest a set of files, so the digest is the file-set digest, and
+ *   evidence without a captured version claims nothing.
+ * - ops attests an operation: its object is the observed attempts, so the digest is derived
+ *   from those events — never from the working tree.
+ * - research attests delivered content: the digest is derived from that delivery.
+ *
+ * Preferring the file digest for every type (which this function used to do) made the "the
+ * object is not a file set" argument false in the implementation: an old deployment or search
+ * then picked up the current file version through its template's fallback and re-refreshed that
+ * binding on every later edit.
  */
 function objectDigestFor(type: TaskType, ctx: ResolveAuditContext): string {
-  const fileDigest = computeObjectDigest(ctx.records)
-  if (fileDigest || type === 'code' || type === 'docs' || type === 'discussion') return fileDigest
-  if (type === 'research') { const d = recordedDelivery(ctx); return d ? sha256({ object: 'research-delivery', text: d.text }) : '' }
-  const attempts = opsAttempts(ctx)
-  return attempts.length ? sha256({ object: 'ops-attempts', attempts }) : ''
+  if (type === 'ops') {
+    const attempts = opsAttempts(ctx)
+    return attempts.length ? sha256({ object: 'ops-attempts', attempts }) : ''
+  }
+  if (type === 'research') {
+    const delivery = deliveryForQuery(ctx, lastExternalQuery(ctx))
+    return delivery ? sha256({ object: 'research-delivery', text: delivery.text }) : ''
+  }
+  return computeObjectDigest(ctx.records)
 }
 
 /**

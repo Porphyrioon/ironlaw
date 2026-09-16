@@ -13,32 +13,41 @@ export function dialectOfTool(toolName: unknown): ShellDialect {
 }
 
 /**
- * One lexical unit of a command: a word (with its value already unescaped and unquoted, and a
- * flag saying whether quoting was involved) or an operator. Keeping the value instead of
- * blanking quoted spans is what lets a quoted path still be recognised as a path while a `>`
- * inside quotes stops being an operator.
+ * One lexical unit of a command: a word (value already unescaped and unquoted, plus whether
+ * quoting was involved) or an operator. `command` marks the word as sitting in command position
+ * — the head of a segment rather than one of its arguments — which is what separates a command
+ * being run from its own argument text.
  */
-export interface ShellToken { value: string; quoted: boolean; operator: string | null }
+export interface ShellToken { value: string; quoted: boolean; operator: string | null; command: boolean }
 
-const OPERATORS = ['>>', '&&', '||', '>', '|', ';', '\n']
+const OPERATORS = ['>>', '&&', '||', '>', '|', ';', '\n', '&']
 
 /**
  * Split a command into tokens using one dialect's rules. Escaping is dialect-specific: POSIX
  * uses `\`, PowerShell uses a backtick, so `` Write-Output `> path `` prints text while
- * `Write-Output \> path` does not. A doubled quote inside a quoted string is a literal quote
- * in both shells.
+ * `Write-Output \> path` does not. A doubled quote inside a quoted string is a literal quote in
+ * both shells. `#` at the start of a word opens a comment, so a `>` written after it is text.
  */
 export function tokenizeShell(command: string, dialect: ShellDialect): ShellToken[] {
   const escape = dialect === 'powershell' ? '`' : '\\'
   const tokens: ShellToken[] = []
-  let value = '', quoted = false, inWord = false
+  let value = '', quoted = false, inWord = false, commandPosition = true
   const flush = (): void => {
     if (!inWord) return
-    tokens.push({ value, quoted, operator: null })
+    // An environment assignment (`NODE_ENV=prod`) does not consume command position.
+    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/.test(value)
+    tokens.push({ value, quoted, operator: null, command: commandPosition && !assignment })
+    if (!assignment) commandPosition = false
     value = ''; quoted = false; inWord = false
   }
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]
+    if (ch === '#' && !inWord) {
+      const end = command.indexOf('\n', i)
+      if (end === -1) break
+      i = end - 1
+      continue
+    }
     if (ch === escape) {
       const next = command[i + 1]
       if (next !== undefined) { value += next; i++ } else value += ch
@@ -61,7 +70,13 @@ export function tokenizeShell(command: string, dialect: ShellDialect): ShellToke
       continue
     }
     const operator = OPERATORS.find(op => command.startsWith(op, i))
-    if (operator) { flush(); tokens.push({ value: operator, quoted: false, operator }); i += operator.length - 1; continue }
+    if (operator) {
+      flush()
+      tokens.push({ value: operator, quoted: false, operator, command: false })
+      commandPosition = true
+      i += operator.length - 1
+      continue
+    }
     if (ch === ' ' || ch === '\t' || ch === '\r') { flush(); continue }
     value += ch; inWord = true
   }
@@ -93,6 +108,7 @@ export function shellWriteTargets(command: string, dialect: ShellDialect = 'posi
       continue
     }
     if (token.operator) continue
+    if (!token.command) continue // only a command being run writes; its arguments do not
     const name = token.value.toLowerCase()
     if (name === 'tee' || name === 'set-content' || name === 'add-content' || name === 'out-file') {
       for (let j = i + 1; j < tokens.length && !tokens[j].operator; j++) {

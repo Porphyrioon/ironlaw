@@ -49,6 +49,8 @@ const user = (h, text, seq = 1) => h.emit('user/message', { source: { kind: 'use
 const assistant = (h, text, seq) => h.emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text }] } }, seq)
 // A session tool/result event with no meta at all: the real stream carries none for shell tools.
 const sessResult = callId => ({ turn: 1, message: { source: { kind: 'tool', callId }, content: [{ type: 'tool-result', toolCallId: callId, isError: false, content: [] }] } })
+// The failure channel the plugin reads for `result_status: 'failed'`: an isError content block.
+const sessFailed = callId => ({ turn: 1, message: { source: { kind: 'tool', callId }, content: [{ type: 'tool-result', toolCallId: callId, isError: true, content: [] }] } })
 const edit = (h, callId, path, cSeq, rSeq) => {
   const args = { file_path: path, old_string: 'a', new_string: 'b' }
   h.emit('tool/call', { turn: 1, callId, name: 'edit', arguments: JSON.stringify(args) }, cSeq)
@@ -299,18 +301,115 @@ test('R2 a remounted plugin recovers the scope, and still invalidates after a ch
 })
 
 // R3 (second review): collecting only usable successes and then claiming "the latest attempt"
-// let a later host-reported failure be invisible, so an earlier success survived it.
-test('R3 a later host-error failure of the same entry point is not success', t => {
-  const root = fixture(t), h = host(root)
+// let a later host-reported failure be invisible, so an earlier success survived it. The failure
+// has to reach BOTH channels DSH uses — the hook's isError and the session result block — which
+// the first version of this test missed, leaving the explicit-failure branch uncovered.
+test('R3 a later host-reported failure of the same entry point is not success', t => {
+  const control = fixture(t), hc = host(control)
+  user(hc, '部署到生产环境')
+  shell(hc, 'd1', './deploy.sh prod', 0, 2, 3)
+  assistant(hc, '已部署。', 4)
+  hc.stop(1)
+  assert.equal(decision(control).verdict, 'verified_complete', 'the single successful deploy passes on its own')
+
+  const root = fixture(t), h = host(root), args = { command: './deploy.sh prod' }
   user(h, '部署到生产环境')
   shell(h, 'd1', './deploy.sh prod', 0, 2, 3)
-  h.emit('tool/call', { turn: 1, callId: 'd2', name: 'pwsh', arguments: JSON.stringify({ command: './deploy.sh prod' }) }, 4)
-  h.toolResultHook('d2', 'pwsh', { command: './deploy.sh prod' }, { isError: true })
-  h.emit('tool/result', sessResult('d2'), 5)
+  h.emit('tool/call', { turn: 1, callId: 'd2', name: 'pwsh', arguments: JSON.stringify(args) }, 4)
+  h.toolResultHook('d2', 'pwsh', args, { isError: true })
+  h.emit('tool/result', sessFailed('d2'), 5)
   assistant(h, '已部署。', 6)
   h.stop(1)
   assert.notEqual(decision(root).verdict, 'verified_complete',
-    'the newest attempt failed, whatever the earlier one did')
+    'the newest attempt failed on the host, whatever the earlier one did')
+})
+
+// T1 (third review): `objectDigestFor` preferred the file digest for every type, so an old
+// deployment or search picked up the current file version and re-refreshed it on every later
+// edit. Each type now has exactly one object domain.
+test('T1 an operation proof does not adopt the working tree as its object', t => {
+  const root = fixture(t), file = join(root, 'config.json')
+  const h = host(root)
+  user(h, '部署到生产环境')
+  shell(h, 'd1', './deploy.sh prod', 0, 2, 3)
+  assistant(h, '已部署。', 4)
+  h.stop(1)
+  const first = proofs(root)
+  assert.equal(decision(root).verdict, 'verified_complete')
+  assert.equal(first.length, 1)
+
+  writeFileSync(file, 'v1\n')
+  edit(h, 'e1', file, 5, 6)
+  assistant(h, '顺手改了配置。', 7)
+  h.stop(2)
+  // The newest proof is the one that must still attest the operation; a re-mint under a moved
+  // file version would append a row whose digest follows the tree.
+  assert.equal(proofs(root).at(-1).object_version_digest, first[0].object_version_digest,
+    'the operation keeps attesting the operation, not the tree')
+})
+
+test('T1 a research proof does not adopt the working tree as its object', t => {
+  const root = fixture(t), file = join(root, 'notes.md')
+  const h = host(root)
+  user(h, '调研一下市面上的方案')
+  named(h, 's1', 'web_search', { query: 'options' }, 2, 3)
+  assistant(h, '调研结论：方案 A 更合适。', 4)
+  h.stop(1)
+  const first = proofs(root)
+  assert.equal(decision(root).verdict, 'verified_complete')
+
+  writeFileSync(file, 'v1\n')
+  edit(h, 'e1', file, 5, 6)
+  assistant(h, '顺手记了笔记。', 7)
+  h.stop(2)
+  assert.equal(proofs(root).at(-1).object_version_digest, first[0].object_version_digest,
+    'the delivery keeps attesting the delivery, not the tree')
+})
+
+// T4 (third review): the tokenizer kept token values, but the write scan never asked whether a
+// token was a command being run. `Set-Content` as an argument, and a `>` inside a comment, are
+// both text.
+test('T4 command arguments and comments are not write syntax', t => {
+  const forms = [
+    path => `Write-Output 'Set-Content' '${path}'`,
+    path => `Write-Output done # > '${path}'`,
+  ]
+  for (const form of forms) {
+    const root = fixture(t), readme = join(root, 'README.md')
+    writeFileSync(readme, 'unchanged\n')
+    const h = host(root)
+    user(h, '更新 README 文档，补充安装说明')
+    shell(h, 'w1', form(readme), 0, 2, 3, 'pwsh')
+    assistant(h, 'README 已更新。', 4)
+    h.stop(1)
+    assert.notEqual(decision(root).verdict, 'verified_complete', `misread as a write: ${form(readme)}`)
+  }
+})
+
+// T5 / old #8 (third review): the flag's `=value` form slipped past the help/version guard, and
+// a backgrounded command's exit code reports the launch rather than the work.
+test('T5 `npm test --help=true` does not verify', t => {
+  const root = fixture(t), file = join(root, 'login.js')
+  writeFileSync(file, 'b\n')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  edit(h, 'e1', file, 2, 3)
+  shell(h, 'v1', 'npm test --help=true', 0, 4, 5)
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete')
+})
+
+test('#8 a backgrounded verification does not verify', t => {
+  const root = fixture(t), file = join(root, 'login.js')
+  writeFileSync(file, 'b\n')
+  const h = host(root)
+  user(h, '修复登录的 bug 并验证')
+  edit(h, 'e1', file, 2, 3)
+  shell(h, 'v1', 'npm test &', 0, 4, 5, 'pwsh')
+  assistant(h, '已修复并验证。', 6)
+  h.stop(1)
+  assert.notEqual(decision(root).verdict, 'verified_complete', 'a launch is not a completion')
 })
 
 // R4: escaping is dialect-specific. A backtick-escaped `>` in PowerShell is text; treating it
